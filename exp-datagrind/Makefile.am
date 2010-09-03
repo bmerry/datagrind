@@ -1,0 +1,41 @@
+include $(top_srcdir)/Makefile.tool.am
+
+EXTRA_DIST = docs/dg-manual.xml
+
+#----------------------------------------------------------------------------
+# datagrind-<platform>
+#----------------------------------------------------------------------------
+
+noinst_PROGRAMS  = datagrind-@VGCONF_ARCH_PRI@-@VGCONF_OS@
+if VGCONF_HAVE_PLATFORM_SEC
+noinst_PROGRAMS += datagrind-@VGCONF_ARCH_SEC@-@VGCONF_OS@
+endif
+
+NONE_SOURCES_COMMON = dg_main.c
+
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_SOURCES      = $(NONE_SOURCES_COMMON)
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_CPPFLAGS     = \
+	$(AM_CPPFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_CFLAGS       = \
+	$(AM_CFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_DEPENDENCIES = \
+	$(TOOL_DEPENDENCIES_@VGCONF_PLATFORM_PRI_CAPS@)
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LDADD        = \
+	$(TOOL_LDADD_@VGCONF_PLATFORM_PRI_CAPS@)
+datagrind_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LDFLAGS      = \
+	$(TOOL_LDFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
+if VGCONF_HAVE_PLATFORM_SEC
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_SOURCES      = $(NONE_SOURCES_COMMON)
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_CPPFLAGS     = \
+	$(AM_CPPFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_CFLAGS       = \
+	$(AM_CFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_DEPENDENCIES = \
+	$(TOOL_DEPENDENCIES_@VGCONF_PLATFORM_SEC_CAPS@)
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LDADD        = \
+	$(TOOL_LDADD_@VGCONF_PLATFORM_SEC_CAPS@)
+datagrind_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LDFLAGS      = \
+	$(TOOL_LDFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
+endif
+
+

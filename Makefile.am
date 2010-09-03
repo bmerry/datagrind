@@ -16,7 +16,8 @@ TOOLS = \
 
 EXP_TOOLS = \
 		exp-sgcheck \
-		exp-bbv
+		exp-bbv \
+		exp-datagrind
 
 # Put docs last because building the HTML is slow and we want to get
 # everything else working before we try it.
