@@ -88,6 +88,10 @@ typedef struct
     GLubyte color[4];
 } vertex;
 
+static GLfloat min_x, max_x, min_y, max_y;
+static GLfloat window_width, window_height;
+static GLint zoom_x, zoom_y;
+
 static void init_gl(void)
 {
     GLuint vbo;
@@ -95,7 +99,8 @@ static void init_gl(void)
     GLubyte color_write[4] = {0, 0, 255, 255};
     vertex *start = NULL;
     vector<vertex> vertices(events.size());
-    GLfloat min_pos = HUGE_VALF, max_pos = -HUGE_VALF;
+    min_x = HUGE_VALF;
+    max_x = -HUGE_VALF;
 
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -103,8 +108,8 @@ static void init_gl(void)
     {
         vertices[i].pos[0] = remap_address(events[i].addr);
         vertices[i].pos[1] = i;
-        min_pos = min(min_pos, vertices[i].pos[0]);
-        max_pos = max(max_pos, vertices[i].pos[0]);
+        min_x = min(min_x, vertices[i].pos[0]);
+        max_x = max(max_x, vertices[i].pos[0]);
         switch (events[i].type)
         {
         case EVENT_TYPE_READ:
@@ -116,28 +121,81 @@ static void init_gl(void)
         }
     }
     glBufferData(GL_ARRAY_BUFFER, events.size() * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
+    if (glGetError() != GL_NO_ERROR)
+    {
+        fprintf(stderr, "Error initialising GL state");
+        exit(1);
+    }
 
     glVertexPointer(2, GL_FLOAT, sizeof(vertex), &start->pos);
     glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(vertex), &start->color);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
 
-    glLoadIdentity();
-    glOrtho(min_pos, max_pos, events.size(), 0.0, -1.0, 1.0);
-
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    min_y = -1.0f;
+    max_y = events.size();
 }
 
 static void display(void)
 {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+    glLoadIdentity();
+    glOrtho(min_x, max_x, max_y, min_y, -1.0, 1.0);
+
+    Addr last = 0;
+    glBegin(GL_LINES);
+    for (map<Addr, size_t>::const_iterator i = page_map.begin(); i != page_map.end(); ++i)
+    {
+        if (i->first != last + PAGE_SIZE)
+        {
+            glColor3ub(255, 255, 255);
+            glVertex2f(i->second, 0.0f);
+            glVertex2f(i->second, events.size());
+        }
+        last = i->first;
+    }
+    glEnd();
+
     glDrawArrays(GL_POINTS, 0, events.size());
+
     glutSwapBuffers();
 }
 
-static void idle(void)
+static void mouse(int button, int state, int x, int y)
 {
-    glutPostRedisplay();
+    printf("%d %d %d %d\n", button, state, x, y);
+
+    if (button == GLUT_LEFT_BUTTON)
+    {
+        if (state == GLUT_DOWN)
+        {
+            zoom_x = x;
+            zoom_y = y;
+        }
+        else if (abs(zoom_x - x) > 2 && abs(zoom_y - y) > 2)
+        {
+            GLfloat x1 = min_x + (zoom_x + 0.5) * (max_x - min_x) / window_width;
+            GLfloat y1 = min_y + (zoom_y + 0.5) * (max_y - min_y) / window_height;
+            GLfloat x2 = min_x + (x + 0.5) * (max_x - min_x) / window_width;
+            GLfloat y2 = min_y + (y + 0.5) * (max_y - min_y) / window_height;
+
+            min_x = min(x1, x2);
+            max_x = max(x1, x2);
+            min_y = min(y1, y2);
+            max_y = max(y1, y2);
+            glutPostRedisplay();
+        }
+    }
+}
+
+static void reshape(int width, int height)
+{
+    window_width = width;
+    window_height = height;
+    glViewport(0, 0, width, height);
 }
 
 int main(int argc, char **argv)
@@ -154,7 +212,8 @@ int main(int argc, char **argv)
     glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
     glutCreateWindow("dg_view");
     glutDisplayFunc(display);
-    glutIdleFunc(idle);
+    glutMouseFunc(mouse);
+    glutReshapeFunc(reshape);
     glewInit();
     init_gl();
     glutMainLoop();
