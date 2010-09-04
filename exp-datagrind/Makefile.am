@@ -3,6 +3,18 @@ include $(top_srcdir)/Makefile.tool.am
 EXTRA_DIST = docs/dg-manual.xml
 
 #----------------------------------------------------------------------------
+# dg_view
+#----------------------------------------------------------------------------
+
+bin_PROGRAMS = dg_view
+
+dg_view_SOURCES = dg_view.cpp
+dg_view_CPPFLAGS = $(AM_CPPFLAGS_PRI)
+dg_view_CFLAGS = $(AM_CFLAGS_PRI)
+dg_view_CCASFLAGS = $(AM_CCASFLAGS_PRI)
+dg_view_LDFLAGS = $(AM_LDFLAGS_PRI)
+
+#----------------------------------------------------------------------------
 # exp-datagrind-<platform>
 #----------------------------------------------------------------------------
 

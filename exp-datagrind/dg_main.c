@@ -30,9 +30,11 @@
 
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
+#include "pub_tool_vki.h"
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
 #include "pub_tool_libcbase.h"
+#include "pub_tool_libcfile.h"
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"
 
@@ -50,19 +52,29 @@ typedef struct
 } Event;
 
 #define NEVENTS 4
+#define OUT_BUF_SIZE 4096
 
 static Event events[NEVENTS];
 static Int nevents = 0;
+static Int out_fd = -1;
+static Char out_buf[OUT_BUF_SIZE];
+static UInt out_buf_used = 0;
+
+static Char *clo_datagrind_out_file = "datagrind.out";
 
 static Bool dg_process_cmd_line_option(Char *arg)
 {
-   /* None yet */
-   return False;
+   if (VG_STR_CLO(arg, "--datagrind-out-file", clo_datagrind_out_file)) {}
+   else
+       return False;
+   return True;
 }
 
 static void dg_print_usage(void)
 {
-   VG_(printf)("");
+   VG_(printf)(
+"    --datagrind-out-file=<file>      output file name [datagrind.out]\n"
+   );
 }
 
 static void dg_print_debug_usage(void)
@@ -72,18 +84,60 @@ static void dg_print_debug_usage(void)
    );
 }
 
+static void prepare_out_file(void)
+{
+   if (out_fd == -1)
+   {
+      SysRes sres;
+      Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
+      sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
+                       VKI_S_IRUSR | VKI_S_IWUSR);
+      if (sr_isError(sres))
+      {
+         VG_(message)(Vg_UserMsg,
+                      "Error: can not open datagrind output file `%s'\n",
+                      filename);
+         VG_(exit)(1);
+      }
+      else
+      {
+         out_fd = (Int) sr_Res(sres);
+      }
+   }
+}
+
 static void dg_post_clo_init(void)
 {
 }
 
+static void out_flush(void)
+{
+   VG_(write)(out_fd, out_buf, out_buf_used);
+   out_buf_used = 0;
+}
+
+static void out_record(const void *buf, Int count)
+{
+   if (count > OUT_BUF_SIZE - out_buf_used)
+      out_flush();
+   VG_(memcpy)(out_buf + out_buf_used, buf, count);
+   out_buf_used += count;
+}
+
 static VG_REGPARM(2) void trace_Dr(Addr addr, SizeT size)
 {
-   VG_(printf)("Dr %08lx,%lu\n", addr, size);
+   Addr meta = (size << 2) | 1;
+   out_record(&meta, sizeof(Addr));
+   out_record(&addr, sizeof(Addr));
+   // VG_(printf)("Dr %08lx,%lu\n", addr, size);
 }
 
 static VG_REGPARM(2) void trace_Dw(Addr addr, SizeT size)
 {
-   VG_(printf)("Dw %08lx,%lu\n", addr, size);
+   Addr meta = (size << 2) | 2;
+   out_record(&meta, sizeof(Addr));
+   out_record(&addr, sizeof(Addr));
+   // VG_(printf)("Dw %08lx,%lu\n", addr, size);
 }
 
 static void flushEvents(IRSB *sb)
@@ -144,11 +198,14 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
 {
    IRSB* sbOut;
    Int i;
+
    if (gWordTy != hWordTy)
    {
       /* We don't currently support this case. */
       VG_(tool_panic)("host/guest word size mismatch");
    }
+
+   prepare_out_file();
 
    sbOut = deepCopyIRSBExceptStmts(sbIn);
 
@@ -229,6 +286,11 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
 
 static void dg_fini(Int exitcode)
 {
+   if (out_fd != -1)
+   {
+      out_flush();
+      VG_(close)(out_fd);
+   }
 }
 
 static void dg_pre_clo_init(void)
