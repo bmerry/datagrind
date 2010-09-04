@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <map>
 
+#include "dg_record.h"
+
 using namespace std;
 
-typedef uintptr_t Addr;
+typedef uintptr_t HWord;
 
 typedef enum
 {
@@ -22,17 +24,18 @@ typedef enum
 
 struct event
 {
-    Addr addr;
+    HWord addr;
     event_type type;
 
     event() {}
-    event(Addr addr, event_type type) : addr(addr), type(type) {}
+    event(HWord addr, event_type type) : addr(addr), type(type) {}
 };
 
 #define PAGE_SIZE 4096
+#define LINE_SIZE 64
 
 static vector<event> events;
-static map<Addr, size_t> page_map;
+static map<HWord, size_t> page_map;
 
 template<typename T> T page_round_down(T x)
 {
@@ -41,7 +44,11 @@ template<typename T> T page_round_down(T x)
 
 static void load(const char *filename)
 {
-    Addr record[2];
+    uint8_t type;
+    uint8_t len;
+    uint8_t *body = NULL;
+    unsigned int body_size = 0;
+    bool first = true;
 
     FILE *f = fopen(filename, "r");
     if (!f)
@@ -49,29 +56,112 @@ static void load(const char *filename)
         fprintf(stderr, "Could not open `%s'.\n", filename);
         exit(1);
     }
-    while (fread(record, sizeof(uintptr_t), 2, f) == 2)
+    while (fread(&type, 1, 1, f) == 1 && fread(&len, 1, 1, f) == 1)
     {
-        int size = record[0] >> 2;
-        int type = record[0] & 3;
-        // printf("%d %#zx,%d\n", type, record[1], size);
-        events.push_back(event(record[1], type == 1 ? EVENT_TYPE_READ : EVENT_TYPE_WRITE));
+        /* No non-zero subtypes or short records so far */
+        if (type & 0x80)
+        {
+            fprintf(stderr, "Warning: unexpected header byte %#x\n", type);
+            continue;
+        }
+        else
+        {
+            if (len > body_size)
+            {
+                delete body;
+                body = new uint8_t[len];
+                body_size = len;
+            }
+            if (fread(body, 1, len, f) != len)
+            {
+                fprintf(stderr, "Warning: short record at end of file\n");
+                break;
+            }
 
-        page_map[page_round_down(events.back().addr)] = 0;
+            if (first)
+            {
+                const char magic[] = "DATAGRIND1";
+                uint8_t version, endian, wordsize;
+                if (type != DG_R_HEADER)
+                {
+                    fprintf(stderr, "Error: did not find header\n");
+                    goto bad_file;
+                }
+                if (len < sizeof(magic) + 3)
+                {
+                    fprintf(stderr, "Error: header too short\n");
+                    goto bad_file;
+                }
+                if (0 != strncmp(magic, (const char *) body, sizeof(magic)))
+                {
+                    fprintf(stderr, "Error: header magic does not match\n");
+                    goto bad_file;
+                }
+                version = body[sizeof(magic)];
+                endian = body[sizeof(magic) + 1];
+                wordsize = body[sizeof(magic) + 2];
+                int expected_version = 1;
+                if (version != 1)
+                {
+                    fprintf(stderr, "Warning: version mismatch (expected %d, got %u).\n",
+                            expected_version, version);
+                }
+                /* TODO: do something useful with endianness */
+                if (wordsize != sizeof(HWord))
+                {
+                    fprintf(stderr, "Error: pointer size mismatch (expected %u, got %u)\n",
+                            (unsigned int) sizeof(HWord), wordsize);
+                    goto bad_file;
+                }
+
+                first = false;
+            }
+            else
+            {
+                switch (type)
+                {
+                case DG_R_HEADER:
+                    fprintf(stderr, "Warning: found header after first record.\n");
+                    goto bad_record;
+                case DG_R_READ:
+                case DG_R_WRITE:
+                    {
+                        if (len != 1 + sizeof(HWord))
+                        {
+                            fprintf(stderr, "Error: Wrong record length");
+                            goto bad_record;
+                        }
+                        uint8_t size = body[0];
+                        HWord addr;
+                        memcpy(&addr, body + 1, sizeof(addr));
+                        events.push_back(event(addr, type == DG_R_READ ? EVENT_TYPE_READ : EVENT_TYPE_WRITE));
+                        page_map[page_round_down(addr)] = 0;
+                    }
+                    break;
+                default:
+                    fprintf(stderr, "Error: unknown record type %#x\n", type);
+                    goto bad_file;
+                }
+            }
+        }
+bad_record:;
     }
+bad_file:
+    delete body;
     fclose(f);
 
     size_t remapped_base = 0;
-    for (map<Addr, size_t>::iterator i = page_map.begin(); i != page_map.end(); i++)
+    for (map<HWord, size_t>::iterator i = page_map.begin(); i != page_map.end(); i++)
     {
         i->second = remapped_base;
         remapped_base += PAGE_SIZE;
     }
 }
 
-static size_t remap_address(Addr a)
+static size_t remap_address(HWord a)
 {
-    Addr base = page_round_down(a);
-    map<Addr, size_t>::const_iterator it = page_map.find(base);
+    HWord base = page_round_down(a);
+    map<HWord, size_t>::const_iterator it = page_map.find(base);
     assert(it != page_map.end());
     return (a - base) + it->second;
 }
@@ -123,7 +213,7 @@ static void init_gl(void)
     glBufferData(GL_ARRAY_BUFFER, events.size() * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
     if (glGetError() != GL_NO_ERROR)
     {
-        fprintf(stderr, "Error initialising GL state");
+        fprintf(stderr, "Error initialising GL state\n");
         exit(1);
     }
 
@@ -145,15 +235,31 @@ static void display(void)
     glLoadIdentity();
     glOrtho(min_x, max_x, max_y, min_y, -1.0, 1.0);
 
-    Addr last = 0;
+    HWord last = 0;
+    GLfloat xrate = (max_x - min_x) / window_width;
     glBegin(GL_LINES);
-    for (map<Addr, size_t>::const_iterator i = page_map.begin(); i != page_map.end(); ++i)
+    for (map<HWord, size_t>::const_iterator i = page_map.begin(); i != page_map.end(); ++i)
     {
         if (i->first != last + PAGE_SIZE)
         {
-            glColor3ub(255, 255, 255);
+            glColor3ub(192, 192, 192);
             glVertex2f(i->second, 0.0f);
             glVertex2f(i->second, events.size());
+        }
+        else if (xrate < PAGE_SIZE / 8)
+        {
+            glColor3ub(64, 64, 64);
+            glVertex2f(i->second, 0.0f);
+            glVertex2f(i->second, events.size());
+        }
+        if (xrate < LINE_SIZE / 8)
+        {
+            glColor3ub(96, 32, 32);
+            for (int j = LINE_SIZE; j < PAGE_SIZE; j += LINE_SIZE)
+            {
+                glVertex2f(i->second + j, 0.0f);
+                glVertex2f(i->second + j, events.size());
+            }
         }
         last = i->first;
     }
@@ -166,8 +272,6 @@ static void display(void)
 
 static void mouse(int button, int state, int x, int y)
 {
-    printf("%d %d %d %d\n", button, state, x, y);
-
     if (button == GLUT_LEFT_BUTTON)
     {
         if (state == GLUT_DOWN)
