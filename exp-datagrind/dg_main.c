@@ -38,6 +38,9 @@
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"
 
+#include "datagrind.h"
+#include "dg_record.h"
+
 typedef enum
 {
    EventType_Dr,
@@ -84,28 +87,6 @@ static void dg_print_debug_usage(void)
    );
 }
 
-static void prepare_out_file(void)
-{
-   if (out_fd == -1)
-   {
-      SysRes sres;
-      Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
-      sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
-                       VKI_S_IRUSR | VKI_S_IWUSR);
-      if (sr_isError(sres))
-      {
-         VG_(message)(Vg_UserMsg,
-                      "Error: can not open datagrind output file `%s'\n",
-                      filename);
-         VG_(exit)(1);
-      }
-      else
-      {
-         out_fd = (Int) sr_Res(sres);
-      }
-   }
-}
-
 static void dg_post_clo_init(void)
 {
 }
@@ -116,7 +97,7 @@ static void out_flush(void)
    out_buf_used = 0;
 }
 
-static void out_record(const void *buf, Int count)
+static void out_bytes(const void *buf, Int count)
 {
    if (count > OUT_BUF_SIZE - out_buf_used)
       out_flush();
@@ -124,20 +105,39 @@ static void out_record(const void *buf, Int count)
    out_buf_used += count;
 }
 
+static void out_byte(Char byte)
+{
+   if (out_buf_used >= OUT_BUF_SIZE)
+      out_flush();
+   out_buf[out_buf_used++] = byte;
+}
+
+static inline void out_word(UWord word)
+{
+   out_bytes(&word, sizeof(word));
+}
+
+static inline void out_string(const Char *str)
+{
+   out_bytes(str, VG_(strlen)(str) + 1);
+}
+
+static inline void trace_access(Addr addr, SizeT size, Char rtype)
+{
+   out_byte(rtype);
+   out_byte(1 + sizeof(addr));
+   out_byte(size);
+   out_word(addr);
+}
+
 static VG_REGPARM(2) void trace_Dr(Addr addr, SizeT size)
 {
-   Addr meta = (size << 2) | 1;
-   out_record(&meta, sizeof(Addr));
-   out_record(&addr, sizeof(Addr));
-   // VG_(printf)("Dr %08lx,%lu\n", addr, size);
+   trace_access(addr, size, DG_R_READ);
 }
 
 static VG_REGPARM(2) void trace_Dw(Addr addr, SizeT size)
 {
-   Addr meta = (size << 2) | 2;
-   out_record(&meta, sizeof(Addr));
-   out_record(&addr, sizeof(Addr));
-   // VG_(printf)("Dw %08lx,%lu\n", addr, size);
+   trace_access(addr, size, DG_R_WRITE);
 }
 
 static void flushEvents(IRSB *sb)
@@ -190,6 +190,42 @@ static void addEvent_Dw(IRSB *sb, IRExpr *daddr, Int dsize)
    addEvent(sb, daddr, dsize, EventType_Dw);
 }
 
+static void prepare_out_file(void)
+{
+   if (out_fd == -1)
+   {
+      SysRes sres;
+      Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
+      sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
+                       VKI_S_IRUSR | VKI_S_IWUSR);
+      if (sr_isError(sres))
+      {
+         VG_(message)(Vg_UserMsg,
+                      "Error: can not open datagrind output file `%s'\n",
+                      filename);
+         VG_(exit)(1);
+      }
+      else
+      {
+         static const Char magic[] = "DATAGRIND1";
+
+         out_fd = (Int) sr_Res(sres);
+         out_byte(DG_R_HEADER);
+         out_byte(sizeof(magic) + 3);
+         out_bytes(magic, sizeof(magic));
+         out_byte(1); /* version */
+#if VG_BIGENDIAN
+         out_byte(1);
+#elif VG_LITTLEENDIAN
+         out_byte(0);
+#else
+         tl_assert(0);
+#endif
+         out_byte(VG_WORDSIZE);
+      }
+   }
+}
+
 static IRSB* dg_instrument(VgCallbackClosure* closure,
                            IRSB* sbIn,
                            VexGuestLayout* layout,
@@ -228,7 +264,9 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_PutI:
          case Ist_MBE:
          case Ist_IMark:
+            break;
          case Ist_Exit:
+            flushEvents(sbOut);
             break;
          case Ist_WrTmp:
             {
@@ -284,6 +322,33 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
    return sbOut;
 }
 
+static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
+{
+   if (!VG_IS_TOOL_USERREQ('D', 'G', args[0]))
+      return False;
+
+   switch (args[0])
+   {
+   case VG_USERREQ__TRACK_RANGE:
+      {
+         UWord addr = args[1];
+         UWord len = args[2];
+         const Char *type = (const Char *) args[3];
+         const Char *label = (const Char *) args[4];
+         out_byte(DG_R_RANGE);
+         out_byte(2 * sizeof(addr) + VG_(strlen)(type) + VG_(strlen)(label) + 2);
+         out_word(addr);
+         out_word(len);
+         out_string(type);
+         out_string(label);
+      }
+      break;
+   default:
+      return False;
+   }
+   return True;
+}
+
 static void dg_fini(Int exitcode)
 {
    if (out_fd != -1)
@@ -309,6 +374,7 @@ static void dg_pre_clo_init(void)
    VG_(needs_command_line_options)(dg_process_cmd_line_option,
                                    dg_print_usage,
                                    dg_print_debug_usage);
+   VG_(needs_client_requests)(dg_handle_client_request);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(dg_pre_clo_init)
