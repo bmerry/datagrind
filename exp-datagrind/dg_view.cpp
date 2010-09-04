@@ -1,10 +1,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
+#include <cassert>
 #include <stdint.h>
 #include <GL/glew.h>
 #include <GL/glut.h>
 #include <vector>
+#include <algorithm>
+#include <map>
 
 using namespace std;
 
@@ -21,11 +25,19 @@ struct event
     Addr addr;
     event_type type;
 
-    Event() {}
-    Event(Addr addr, event_type type) : addr(addr), type(type) {}
+    event() {}
+    event(Addr addr, event_type type) : addr(addr), type(type) {}
 };
 
+#define PAGE_SIZE 4096
+
 static vector<event> events;
+static map<Addr, size_t> page_map;
+
+template<typename T> T page_round_down(T x)
+{
+    return x & ~(PAGE_SIZE - 1);
+}
 
 static void load(const char *filename)
 {
@@ -41,66 +53,86 @@ static void load(const char *filename)
     {
         int size = record[0] >> 2;
         int type = record[0] & 3;
-        printf("%d %#zx,%d\n", type, record[1], size);
+        // printf("%d %#zx,%d\n", type, record[1], size);
         events.push_back(event(record[1], type == 1 ? EVENT_TYPE_READ : EVENT_TYPE_WRITE));
+
+        page_map[page_round_down(events.back().addr)] = 0;
     }
     fclose(f);
+
+    size_t remapped_base = 0;
+    for (map<Addr, size_t>::iterator i = page_map.begin(); i != page_map.end(); i++)
+    {
+        i->second = remapped_base;
+        remapped_base += PAGE_SIZE;
+    }
+}
+
+static size_t remap_address(Addr a)
+{
+    Addr base = page_round_down(a);
+    map<Addr, size_t>::const_iterator it = page_map.find(base);
+    assert(it != page_map.end());
+    return (a - base) + it->second;
 }
 
 static void usage(const char *prog, int code)
 {
-    fprintf("Usage: %s <file>\n", prog);
+    fprintf(stderr, "Usage: %s <file>\n", prog);
     exit(code);
 }
 
 typedef struct
 {
-    GLuint addr;
-    GLuint time;
+    GLfloat pos[2];
     GLubyte color[4];
 } vertex;
 
 static void init_gl(void)
 {
     GLuint vbo;
-    vertex *ptr;
     GLubyte color_read[4] = {0, 255, 0, 255};
     GLubyte color_write[4] = {0, 0, 255, 255};
     vertex *start = NULL;
+    vector<vertex> vertices(events.size());
+    GLfloat min_pos = HUGE_VALF, max_pos = -HUGE_VALF;
 
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, events.size() * sizeof(vertex), NULL, GL_STATIC_DRAW);
-    ptr = (vertex *) glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
     for (size_t i = 0; i < events.size(); i++)
     {
-        ptr[i].addr = events[i].addr >> 4;
-        ptr[i].time = i;
+        vertices[i].pos[0] = remap_address(events[i].addr);
+        vertices[i].pos[1] = i;
+        min_pos = min(min_pos, vertices[i].pos[0]);
+        max_pos = max(max_pos, vertices[i].pos[0]);
         switch (events[i].type)
         {
         case EVENT_TYPE_READ:
-            memcpy(ptr[i].color, color_read, sizeof(color_read));
+            memcpy(vertices[i].color, color_read, sizeof(color_read));
             break;
         case EVENT_TYPE_WRITE:
-            memcpy(ptr[i].color, color_write, sizeof(color_write));
+            memcpy(vertices[i].color, color_write, sizeof(color_write));
             break;
         }
     }
-    glUnmapBuffer(GL_ARRAY_BUFFER);
+    glBufferData(GL_ARRAY_BUFFER, events.size() * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
 
-    glVertexPointer(2, GL_UNSIGNED_INT, sizeof(vertex), &start->addr);
+    glVertexPointer(2, GL_FLOAT, sizeof(vertex), &start->pos);
     glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(vertex), &start->color);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
 
     glLoadIdentity();
-    glOrtho(0.0, 1.0, 1.0, 0.0, -1.0, 1.0);
+    glOrtho(min_pos, max_pos, events.size(), 0.0, -1.0, 1.0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 static void display(void)
 {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glDrawArrays(GL_POINTS, 0, events.size());
+    glutSwapBuffers();
 }
 
 static void idle(void)
@@ -119,7 +151,7 @@ int main(int argc, char **argv)
     load(argv[1]);
 
     glutInitWindowSize(800, 600);
-    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
     glutCreateWindow("dg_view");
     glutDisplayFunc(display);
     glutIdleFunc(idle);
