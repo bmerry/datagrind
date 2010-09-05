@@ -445,11 +445,12 @@ int main(int argc, char **argv)
     {
         usage(argv[0], 2);
     }
-    //chosen_ranges.insert("array");
-    //chosen_ranges.insert("scratch");
-    //chosen_events.insert("quick_sort");
-    //chosen_events.insert("merge_sort");
     load(argv[1]);
+    if (accesses.empty())
+    {
+        fprintf(stderr, "No accesses match the criteria.\n");
+        return 0;
+    }
 
     glutInitWindowSize(800, 800);
     glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
