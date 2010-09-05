@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <assert.h>
 
+#include "../datagrind.h"
+
 #define SWAP(a, b) do { int t = (a); (a) = (b); (b) = t; } while (0)
 
 static void bubble_sort(int n, int *a)
@@ -100,7 +102,9 @@ static void merge_sort(int n, int *a)
     int * restrict pegs[2];
     pegs[0] = a;
     pegs[1] = malloc(n * sizeof(int));
+    DATAGRIND_TRACK_RANGE(pegs[1], n * sizeof(int), "int", "scratch");
     merge_sort_r(n, pegs, 0);
+    DATAGRIND_UNTRACK_RANGE(pegs[1], n * sizeof(int));
     free(pegs[1]);
 }
 
@@ -129,14 +133,19 @@ static void builtin_sort(int n, int *a)
 static void run_sort(const char *name, void (*fn)(int, int *), int n)
 {
     int *a = malloc(n * sizeof(int));
+
+    DATAGRIND_TRACK_RANGE(a, n * sizeof(int), "int", "array");
     srand(1);
     for (int i = 0; i < n; i++)
         a[i] = rand();
+    DATAGRIND_START_EVENT(name);
     fn(n, a);
+    DATAGRIND_END_EVENT(name);
     if (!validate(n, a))
     {
         fprintf(stderr, "%s did not sort correctly!\n", name);
     }
+    DATAGRIND_UNTRACK_RANGE(a, n * sizeof(int));
     free(a);
 }
 
