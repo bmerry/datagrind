@@ -4,3 +4,4 @@ noinst_PROGRAMS = sorts
 
 sorts_SOURCES = sorts.c
 sorts_CFLAGS = -std=c99 -O2
+sorts_LDADD = -lm
