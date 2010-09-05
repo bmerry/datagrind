@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <GL/glew.h>
 #include <GL/glut.h>
+#include <getopt.h>
 #include <vector>
 #include <algorithm>
 #include <set>
@@ -283,7 +284,7 @@ static size_t remap_address(HWord a)
 
 static void usage(const char *prog, int code)
 {
-    fprintf(stderr, "Usage: %s <file>\n", prog);
+    fprintf(stderr, "Usage: %s [--ranges=r1,r2] [--events=e1,e1] <file>\n", prog);
     exit(code);
 }
 
@@ -437,9 +438,73 @@ static void reshape(int width, int height)
     glViewport(0, 0, width, height);
 }
 
+/* Splits a string to pieces on commas. Empty parts are preserved, but if
+ * s is empty then no strings are returned.
+ */
+static vector<string> split_comma(const string &s)
+{
+    vector<string> out;
+    string::size_type pos = 0;
+
+    if (s.empty()) return out;
+    while (true)
+    {
+        string::size_type next = s.find(',', pos);
+        if (next == string::npos)
+        {
+            /* End of string - capture the last element */
+            out.push_back(s.substr(pos));
+            return out;
+        }
+        out.push_back(s.substr(pos, next - pos));
+        pos = next + 1;
+    }
+}
+
+static void parse_opts(int *argc, char **argv)
+{
+    static const struct option longopts[] =
+    {
+        { "ranges", 1, NULL, 'r' },
+        { "events", 1, NULL, 'e' },
+        { NULL, 0, NULL, 0 }
+    };
+    int opt;
+
+    while ((opt = getopt_long(*argc, argv, "r:e:", longopts, NULL)) != -1)
+    {
+        switch (opt)
+        {
+        case 'r':
+            {
+                vector<string> ranges = split_comma(optarg);
+                chosen_ranges = set<string>(ranges.begin(), ranges.end());
+            }
+            break;
+        case 'e':
+            {
+                vector<string> events = split_comma(optarg);
+                chosen_events = set<string>(events.begin(), events.end());
+            }
+            break;
+        case '?':
+        case ':':
+            exit(2);
+        default:
+            assert(0);
+        }
+    }
+
+    /* Remove options from argv */
+    for (int i = optind; i < *argc; i++)
+        argv[i - optind + 1] = argv[i];
+    *argc -= optind - 1;
+}
+
 int main(int argc, char **argv)
 {
     glutInit(&argc, argv);
+    parse_opts(&argc, argv);
 
     if (argc != 2)
     {
