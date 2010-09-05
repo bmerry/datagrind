@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <math.h>
 
 #include "../datagrind.h"
 
@@ -43,7 +44,25 @@ static void insertion_sort(int n, int *a)
     }
 }
 
-static bool validate(int n, int *a);
+static void shell_sort(int n, int *a)
+{
+    int inc = (n + 1) / 2;
+    while (inc > 0)
+    {
+        for (int i = inc; i < n; i++)
+        {
+            int v = a[i];
+            int p = i - inc;
+            while (p >= 0 && a[p] > v)
+            {
+                a[p + inc] = a[p];
+                p -= inc;
+            }
+            a[p + inc] = v;
+        }
+        inc = (int) round(inc / 2.2);
+    }
+}
 
 static void quick_sort(int n, int *a)
 {
@@ -108,6 +127,48 @@ static void merge_sort(int n, int *a)
     free(pegs[1]);
 }
 
+static void heap_up(int *a, int p)
+{
+    int v = a[p];
+    while (p > 0)
+    {
+        int next = (p - 1) / 2;
+        if (a[next] > v)
+            break;
+        a[p] = a[next];
+        p = next;
+    }
+    a[p] = v;
+}
+
+static void heap_down(int n, int *a, int p)
+{
+    int v = a[p];
+    int l = p * 2 + 1;
+    while (l < n)
+    {
+        if (l + 1 < n && a[l + 1] > a[l])
+            l++;
+        if (v > a[l])
+            break;
+        a[p] = a[l];
+        p = l;
+        l = 2 * p + 1;
+    }
+    a[p] = v;
+}
+
+static void heap_sort(int n, int *a)
+{
+    for (int i = n / 2 - 1; i >= 0; i--)
+        heap_down(n, a, i);
+    for (int i = n - 1; i > 0; i--)
+    {
+        SWAP(a[i], a[0]);
+        heap_down(i, a, 0);
+    }
+}
+
 static bool validate(int n, int *a)
 {
     for (int i = 1; i < n; i++)
@@ -154,8 +215,10 @@ int main(void)
     run_sort("bubble_sort", bubble_sort, 200);
     run_sort("selection_sort", selection_sort, 200);
     run_sort("insertion_sort", insertion_sort, 200);
+    run_sort("shell_sort", shell_sort, 200);
     run_sort("quick_sort", quick_sort, 200);
     run_sort("merge_sort", merge_sort, 200);
+    run_sort("heap_sort", heap_sort, 200);
     run_sort("builtin_sort", builtin_sort, 200);
     return 0;
 }
