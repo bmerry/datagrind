@@ -29,6 +29,9 @@
 #define DG_R_HEADER           0
 #define DG_R_READ             1
 #define DG_R_WRITE            2
-#define DG_R_RANGE            3
+#define DG_R_TRACK_RANGE      3
+#define DG_R_UNTRACK_RANGE    4
+#define DG_R_START_EVENT      5
+#define DG_R_END_EVENT        6
 
 #endif /* __DG_RECORD_H */

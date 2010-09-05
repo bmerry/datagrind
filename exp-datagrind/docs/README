@@ -4,17 +4,10 @@ means the size of a pointer); there is sufficient header information to
 determine this from the file itself.  Addresses in the file may be misaligned,
 so it is not suitable for using directly with mmap.
 
-The first byte contains bitfields, made up as follows:
-
-3:0   Record type
-6:4   Record subtype
-7:7   Short record
-
-If bit 7 of the first byte is 0, then the second byte contains the entire
-payload. Otherwise, the second byte contains the length of the record in bytes,
-excluding the first two bytes. The length 255 is reserved for future use.
-
-Where a record does not specify subtypes, the subtype field must be zero.
+The first byte contains the record type. If bit 7 of the record type is 0, then
+the second byte contains the entire payload. Otherwise, the second byte
+contains the length of the record in bytes, excluding the first two bytes. The
+length 255 is reserved for future use.
 
 The available record types are:
 
@@ -30,9 +23,19 @@ Indicates a data read or write. This is followed by
   - the size of the access (byte)
   - the address of the access (word).
 
-- DG_R_RANGE(3)
+- DG_R_TRACK_RANGE(3)
 Indicates a DATAGRIND_TRACK_RANGE client request. This is followed by
   - an address (1 word)
   - a length (1 word)
   - a type name (NUL-terminated string)
   - a label (NUL-terminated string).
+
+- DG_R_UNTRACK_RANGE(4)
+Indicates a DATAGRIND_UNTRACK_RANGE client request. This is followed by
+  - an address (1 word)
+  - a length (1 word)
+
+- DG_R_START_EVENT(5), DG_R_END_EVENT(6)
+Indicates a DATAGRIND_START_EVENT/DATAGRIND_END_EVENT client request. This is
+followed by
+  - a label (NUL-terminated string)

@@ -11,7 +11,7 @@
    ----------------------------------------------------------------
 
    This file is part of DataGrind, a heavyweight Valgrind tool for
-   tracking data accesses.
+   tracking data accesses. It is based on callgrind.h from Valgrind 3.5.0.
 
    Copyright (C) 2010 Bruce Merry.  All rights reserved.
 
@@ -64,6 +64,9 @@
 typedef enum
 {
    VG_USERREQ__TRACK_RANGE = VG_USERREQ_TOOL_BASE('D', 'G'),
+   VG_USERREQ__UNTRACK_RANGE,
+   VG_USERREQ__START_EVENT,
+   VG_USERREQ__END_EVENT,
 
    _VG_USERREQ__DATAGRIND_RECORD_OVERLAP_ERROR = VG_USERREQ_TOOL_BASE('D', 'G') + 256
 } Vg_DataGrindClientRequest;
@@ -76,7 +79,36 @@ typedef enum
    (__extension__({unsigned long _qzz_res;                                \
     VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */,          \
                                VG_USERREQ__TRACK_RANGE,                   \
-                               _qzz_addr, _qzz_len, _qzz_type, 0, 0, 0);  \
+                               _qzz_addr, _qzz_len, _qzz_type, _qzz_label, 0);  \
+    _qzz_res;                                                             \
+   }))
+
+/* Cease tracking a range previously registered by DATAGRIND_TRACK_RANGE. The
+ * address and length must match exactly.
+ */
+#define DATAGRIND_UNTRACK_RANGE(_qzz_addr, _qzz_len) \
+   (__extension__({unsigned long _qzz_res;                                \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */,          \
+                               VG_USERREQ__UNTRACK_RANGE,                 \
+                               _qzz_addr, _qzz_len, 0, 0, 0);             \
+    _qzz_res;                                                             \
+   }))
+
+/* Mark the start of an event. */
+#define DATAGRIND_START_EVENT(_qzz_label) \
+   (__extension__({unsigned long _qzz_res;                                \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */,          \
+                               VG_USERREQ__START_EVENT,                   \
+                               _qzz_label, 0, 0, 0, 0);                   \
+    _qzz_res;                                                             \
+   }))
+
+/* Mark the end of an event */
+#define DATAGRIND_END_EVENT(_qzz_label) \
+   (__extension__({unsigned long _qzz_res;                                \
+    VALGRIND_DO_CLIENT_REQUEST(_qzz_res, 0 /* default return */,          \
+                               VG_USERREQ__END_EVENT,                     \
+                               _qzz_label, 0, 0, 0, 0);                   \
     _qzz_res;                                                             \
    }))
 

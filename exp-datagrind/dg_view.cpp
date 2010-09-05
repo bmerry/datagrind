@@ -8,7 +8,9 @@
 #include <GL/glut.h>
 #include <vector>
 #include <algorithm>
+#include <set>
 #include <map>
+#include <string>
 
 #include "dg_record.h"
 
@@ -18,24 +20,38 @@ typedef uintptr_t HWord;
 
 typedef enum
 {
-    EVENT_TYPE_READ,
-    EVENT_TYPE_WRITE
-} event_type;
+    ACCESS_TYPE_READ,
+    ACCESS_TYPE_WRITE,
+} access_type;
 
-struct event
+struct mem_access
 {
     HWord addr;
-    event_type type;
+    uint8_t size;
+    access_type type;
+    uint64_t seq;
 
-    event() {}
-    event(HWord addr, event_type type) : addr(addr), type(type) {}
+    mem_access() {}
+    mem_access(HWord addr, uint8_t size, access_type type, uint64_t seq) : addr(addr), size(size), type(type), seq(seq) {}
 };
 
 #define PAGE_SIZE 4096
 #define LINE_SIZE 64
 
-static vector<event> events;
+/* All START_EVENTs with no matching END_EVENT from chosen_events */
+static multiset<string> active_events;
+/* All TRACK_RANGEs with no matching UNTRACK_RANGE from chosen_ranges */
+static multiset<pair<HWord, HWord> > active_ranges;
+
+/* Events selected on the command line, or empty if there wasn't a choice */
+static set<string> chosen_events;
+/* Ranges selected on the command line, or empty if there wasn't a choice */
+static set<string> chosen_ranges;
+
+static vector<mem_access> accesses;
 static map<HWord, size_t> page_map;
+
+static GLuint num_vertices;
 
 template<typename T> T page_round_down(T x)
 {
@@ -49,6 +65,7 @@ static void load(const char *filename)
     uint8_t *body = NULL;
     unsigned int body_size = 0;
     bool first = true;
+    size_t seq = 0;
 
     FILE *f = fopen(filename, "r");
     if (!f)
@@ -66,17 +83,18 @@ static void load(const char *filename)
         }
         else
         {
-            if (len > body_size)
+            if (len >= body_size)
             {
-                delete body;
-                body = new uint8_t[len];
-                body_size = len;
+                delete[] body;
+                body = new uint8_t[len + 1];
+                body_size = len + 1;
             }
             if (fread(body, 1, len, f) != len)
             {
                 fprintf(stderr, "Warning: short record at end of file\n");
                 break;
             }
+            body[len] = '\0'; /* Guarantees termination of embedded strings */
 
             if (first)
             {
@@ -134,13 +152,110 @@ static void load(const char *filename)
                         uint8_t size = body[0];
                         HWord addr;
                         memcpy(&addr, body + 1, sizeof(addr));
-                        events.push_back(event(addr, type == DG_R_READ ? EVENT_TYPE_READ : EVENT_TYPE_WRITE));
-                        page_map[page_round_down(addr)] = 0;
+
+                        bool matched;
+                        if (!chosen_events.empty() && active_events.empty())
+                            matched = false;
+                        else if (!chosen_ranges.empty())
+                        {
+                            matched = false;
+                            for (multiset<pair<HWord, HWord> >::const_iterator i = active_ranges.begin(); i != active_ranges.end(); ++i)
+                            {
+                                if (addr + size > i->first && addr < i->first + i->second)
+                                {
+                                    matched = true;
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                            matched = true;
+                        if (matched)
+                        {
+                            accesses.push_back(mem_access(addr, size, type == DG_R_READ ? ACCESS_TYPE_READ : ACCESS_TYPE_WRITE, seq));
+                            page_map[page_round_down(addr)] = 0;
+                        }
+                        seq++;
+                    }
+                    break;
+                case DG_R_TRACK_RANGE:
+                    {
+                        HWord addr;
+                        HWord size;
+                        const uint8_t *ptr = body;
+                        if (len < 2 * sizeof(HWord) + 2)
+                        {
+                            fprintf(stderr, "Error: record too short (%d < %zu)\n",
+                                    len, 2 * sizeof(HWord) + 2);
+                            goto bad_record;
+                        }
+                        memcpy(&addr, ptr, sizeof(addr));
+                        ptr += sizeof(addr);
+                        memcpy(&size, ptr, sizeof(size));
+                        ptr += sizeof(size);
+                        string var_type = (const char *) ptr;
+                        ptr += var_type.size() + 1;
+                        if (ptr >= body + len)
+                        {
+                            fprintf(stderr, "Error: record missing field\n");
+                            goto bad_record;
+                        }
+                        string label = (const char *) ptr;
+                        ptr += label.size() + 1;
+                        if (ptr != body + len)
+                        {
+                            fprintf(stderr, "Error: record not properly terminated (%p vs %p)\n",
+                                    ptr, body + len);
+                            goto bad_record;
+                        }
+
+                        if (chosen_ranges.count(label))
+                            active_ranges.insert(make_pair(addr, size));
+                    }
+                    break;
+                case DG_R_UNTRACK_RANGE:
+                    {
+                        HWord addr;
+                        HWord size;
+                        if (len != 2 * sizeof(HWord))
+                        {
+                            fprintf(stderr, "Error: record has wrong size\n");
+                            goto bad_record;
+                        }
+                        memcpy(&addr, body, sizeof(addr));
+                        memcpy(&size, body + sizeof(addr), sizeof(size));
+
+                        pair<HWord, HWord> key(addr, size);
+                        multiset<pair<HWord, HWord> >::iterator it = active_ranges.find(key);
+                        if (it != active_ranges.end())
+                            active_ranges.erase(it);
+                    }
+                    break;
+                case DG_R_START_EVENT:
+                case DG_R_END_EVENT:
+                    {
+                        string label = (char *) body;
+                        if (label.size() + 1 != len)
+                        {
+                            fprintf(stderr, "Error: record not properly terminated\n");
+                            goto bad_record;
+                        }
+                        if (chosen_events.count(label))
+                        {
+                            if (type == DG_R_START_EVENT)
+                                active_events.insert(label);
+                            else
+                            {
+                                multiset<string>::iterator it = active_events.find(label);
+                                if (it != active_events.end())
+                                    active_events.erase(it);
+                            }
+                        }
                     }
                     break;
                 default:
-                    fprintf(stderr, "Error: unknown record type %#x\n", type);
-                    goto bad_file;
+                    fprintf(stderr, "Warning: unknown record type %#x\n", type);
+                    goto bad_record;
                 }
             }
         }
@@ -182,35 +297,53 @@ static GLfloat min_x, max_x, min_y, max_y;
 static GLfloat window_width, window_height;
 static GLint zoom_x, zoom_y;
 
+static size_t count_access_bytes(void)
+{
+    size_t total = 0;
+    for (size_t i = 0; i < accesses.size(); i++)
+        total += accesses[i].size;
+    return total;
+}
+
 static void init_gl(void)
 {
     GLuint vbo;
     GLubyte color_read[4] = {0, 255, 0, 255};
     GLubyte color_write[4] = {0, 0, 255, 255};
     vertex *start = NULL;
-    vector<vertex> vertices(events.size());
+    num_vertices = count_access_bytes();
+
+    vector<vertex> vertices(num_vertices);
     min_x = HUGE_VALF;
     max_x = -HUGE_VALF;
 
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    for (size_t i = 0; i < events.size(); i++)
+    size_t v = 0;
+    for (size_t i = 0; i < accesses.size(); i++)
     {
-        vertices[i].pos[0] = remap_address(events[i].addr);
-        vertices[i].pos[1] = i;
-        min_x = min(min_x, vertices[i].pos[0]);
-        max_x = max(max_x, vertices[i].pos[0]);
-        switch (events[i].type)
+        for (int j = 0; j < accesses[i].size; j++)
         {
-        case EVENT_TYPE_READ:
-            memcpy(vertices[i].color, color_read, sizeof(color_read));
-            break;
-        case EVENT_TYPE_WRITE:
-            memcpy(vertices[i].color, color_write, sizeof(color_write));
-            break;
+            vertices[v].pos[0] = remap_address(accesses[i].addr) + j;
+            vertices[v].pos[1] = accesses[i].seq;
+            min_x = min(min_x, vertices[v].pos[0]);
+            max_x = max(max_x, vertices[v].pos[0]);
+            switch (accesses[i].type)
+            {
+            case ACCESS_TYPE_READ:
+                memcpy(vertices[v].color, color_read, sizeof(color_read));
+                break;
+            case ACCESS_TYPE_WRITE:
+                memcpy(vertices[v].color, color_write, sizeof(color_write));
+                break;
+            }
+            v++;
         }
     }
-    glBufferData(GL_ARRAY_BUFFER, events.size() * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
+    assert(v == num_vertices);
+    vector<mem_access>().swap(accesses); // free memory for accesses
+
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, num_vertices * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
     if (glGetError() != GL_NO_ERROR)
     {
         fprintf(stderr, "Error initialising GL state\n");
@@ -221,11 +354,13 @@ static void init_gl(void)
     glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(vertex), &start->color);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
+    glBlendFuncSeparate(GL_ONE, GL_DST_ALPHA, GL_ONE, GL_ZERO);
+    glEnable(GL_BLEND);
 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-    min_y = -1.0f;
-    max_y = events.size();
+    min_y = vertices[0].pos[1] - 1.0f;
+    max_y = vertices.back().pos[1] + 1.0f;
 }
 
 static void display(void)
@@ -242,30 +377,30 @@ static void display(void)
     {
         if (i->first != last + PAGE_SIZE)
         {
-            glColor3ub(192, 192, 192);
-            glVertex2f(i->second, 0.0f);
-            glVertex2f(i->second, events.size());
+            glColor4ub(192, 192, 192, 0);
+            glVertex2f(i->second, min_y);
+            glVertex2f(i->second, max_y);
         }
         else if (xrate < PAGE_SIZE / 8)
         {
-            glColor3ub(64, 64, 64);
-            glVertex2f(i->second, 0.0f);
-            glVertex2f(i->second, events.size());
+            glColor4ub(64, 64, 64, 0);
+            glVertex2f(i->second, min_y);
+            glVertex2f(i->second, max_y);
         }
         if (xrate < LINE_SIZE / 8)
         {
-            glColor3ub(96, 32, 32);
+            glColor4ub(96, 32, 32, 0);
             for (int j = LINE_SIZE; j < PAGE_SIZE; j += LINE_SIZE)
             {
-                glVertex2f(i->second + j, 0.0f);
-                glVertex2f(i->second + j, events.size());
+                glVertex2f(i->second + j, min_y);
+                glVertex2f(i->second + j, max_y);
             }
         }
         last = i->first;
     }
     glEnd();
 
-    glDrawArrays(GL_POINTS, 0, events.size());
+    glDrawArrays(GL_POINTS, 0, num_vertices);
 
     glutSwapBuffers();
 }
@@ -310,9 +445,13 @@ int main(int argc, char **argv)
     {
         usage(argv[0], 2);
     }
+    //chosen_ranges.insert("array");
+    //chosen_ranges.insert("scratch");
+    //chosen_events.insert("quick_sort");
+    //chosen_events.insert("merge_sort");
     load(argv[1]);
 
-    glutInitWindowSize(800, 600);
+    glutInitWindowSize(800, 800);
     glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
     glutCreateWindow("dg_view");
     glutDisplayFunc(display);

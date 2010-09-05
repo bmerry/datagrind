@@ -117,11 +117,6 @@ static inline void out_word(UWord word)
    out_bytes(&word, sizeof(word));
 }
 
-static inline void out_string(const Char *str)
-{
-   out_bytes(str, VG_(strlen)(str) + 1);
-}
-
 static inline void trace_access(Addr addr, SizeT size, Char rtype)
 {
    out_byte(rtype);
@@ -335,12 +330,41 @@ static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
          UWord len = args[2];
          const Char *type = (const Char *) args[3];
          const Char *label = (const Char *) args[4];
-         out_byte(DG_R_RANGE);
-         out_byte(2 * sizeof(addr) + VG_(strlen)(type) + VG_(strlen)(label) + 2);
+         SizeT type_len = VG_(strlen)(type);
+         SizeT label_len = VG_(strlen)(label);
+
+         if (type_len > 64) type_len = 64;
+         if (label_len > 64) label_len = 64;
+         out_byte(DG_R_TRACK_RANGE);
+         out_byte(2 * sizeof(addr) + type_len + label_len + 2);
          out_word(addr);
          out_word(len);
-         out_string(type);
-         out_string(label);
+         out_bytes(type, type_len);
+         out_byte('\0');
+         out_bytes(label, label_len);
+         out_byte('\0');
+      }
+      break;
+   case VG_USERREQ__UNTRACK_RANGE:
+      {
+          UWord addr = args[1];
+          UWord len = args[2];
+          out_byte(DG_R_UNTRACK_RANGE);
+          out_byte(2 * sizeof(addr));
+          out_word(addr);
+          out_word(len);
+      }
+      break;
+   case VG_USERREQ__START_EVENT:
+   case VG_USERREQ__END_EVENT:
+      {
+          const Char *label = (const Char *) args[1];
+          SizeT label_len = VG_(strlen)(label);
+          if (label_len > 64) label_len = 64;
+          out_byte(args[0] == VG_USERREQ__START_EVENT ? DG_R_START_EVENT : DG_R_END_EVENT);
+          out_byte(label_len + 1);
+          out_bytes(label, label_len);
+          out_byte('\0');
       }
       break;
    default:
