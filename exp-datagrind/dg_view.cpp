@@ -344,10 +344,18 @@ static void init_gl(void)
 
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, num_vertices * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
+
     if (glGetError() != GL_NO_ERROR)
     {
         fprintf(stderr, "Error initialising GL state\n");
+        exit(1);
+    }
+    glBufferData(GL_ARRAY_BUFFER, num_vertices * sizeof(vertex), &vertices[0], GL_STATIC_DRAW);
+    if (glGetError() != GL_NO_ERROR)
+    {
+        fprintf(stderr,
+                "Error loading buffer data. It may be more than your GL implementation can handle.\n"
+                "Try using the --events and --ranges options.\n");
         exit(1);
     }
 
@@ -362,6 +370,12 @@ static void init_gl(void)
 
     min_y = vertices[0].pos[1] - 1.0f;
     max_y = vertices.back().pos[1] + 1.0f;
+
+    if (glGetError() != GL_NO_ERROR)
+    {
+        fprintf(stderr, "Error initialising GL state\n");
+        exit(1);
+    }
 }
 
 static void display(void)
@@ -518,12 +532,17 @@ int main(int argc, char **argv)
     }
 
     glutInitWindowSize(800, 800);
-    glutInitDisplayMode(GLUT_RGBA | GLUT_DEPTH | GLUT_DOUBLE);
+    glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE);
     glutCreateWindow("dg_view");
     glutDisplayFunc(display);
     glutMouseFunc(mouse);
     glutReshapeFunc(reshape);
     glewInit();
+    if (!GLEW_VERSION_1_5)
+    {
+        fprintf(stderr, "OpenGL 1.5 or later is required.\n");
+        return 1;
+    }
     init_gl();
     glutMainLoop();
 

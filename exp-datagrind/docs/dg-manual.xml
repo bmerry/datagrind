@@ -1,0 +1,254 @@
+<?xml version="1.0"?>
+<!DOCTYPE chapter PUBLIC "-//OASIS//DTD DocBook XML V4.2//EN"
+  "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd"
+[ <!ENTITY % vg-entities SYSTEM "../../docs/xml/vg-entities.xml"> %vg-entities; ]>
+
+<chapter id="dg-manual" xreflabel="Datagrind: a data access logger">
+<title>Datagrind: a data accessor logger</title>
+
+<para>To use this tool, you must specify <option>--tool=datagrind</option> on
+the Valgrind command line.</para>
+
+<sect1 id="dg-manual.overview" xreflabel="Overview">
+<title>Overview</title>
+
+<para>Datagrind captures all read and write accesses made by a program and
+records them in a log file. A separate tool (dg_view), can
+then be used to visually represent the reads and write.</para>
+
+</sect1>
+
+<sect1 id="dg-manual.using" xreflabel="Using Datagrind and dg_view">
+<title>Using Datagrind and dg_view</title>
+
+<para>At present, Datagrind does not make any use of the debugging information
+from the executable (the <option>-g</option> compiler option). If you are
+tuning your program, you should compile with optimisation, as this will show
+how your program will really access memory. If you are trying to understand
+your program, it may be more useful to disable optimization so that memory
+accesses will be done in the same way they appear in source code.</para>
+
+<para>Once you've built your program, you need to run Datagrind to gather the
+log of memory accesses. Since every memory access is recorded, this file can
+get big extremely quickly, and so you should not try to capture more than a
+second or two of execution (even if you have the storage for a bigger capture,
+dg_view does not currently cope well with very large files).</para>
+
+<para>Once you've captured a log, you can then use dg_view to examine it
+visually.</para>
+
+<sect2 id="dg-manual.running-datagrind" xreflabel="Running Datagrind">
+<title>Running Datagrind</title>
+
+<para>To run Datagrind on a program <filename>prog</filename>, run:</para>
+<screen>valgrind --tool=datagrind prog</screen>
+
+<para>The program will execute. Datagrind does not output any diagnostic
+messages. By default, the output log will be written to
+<filename>datagrind.out.<replaceable>pid</replaceable></filename>, but this
+can be changed by passing the option
+<option>--datagrind-out-file=<replaceable>filename.out</replaceable></option>
+to Valgrind.</para>
+
+</sect2>
+
+<sect2 id="dg-manual.running-dg_view" xreflabel="Running dg_view">
+<title>Running dg_view</title>
+
+<para>dg_view is a quick-and-dirty viewer for the output of Datagrind. It
+relies on OpenGL 1.5 or later, GLUT, and GLEW. It also relies on using video
+memory to store the data, so it can fail if you try to view too big a log
+file.</para>
+
+<para>To use dg_view, simply run</para>
+<screen>dg_view <replaceable>datagrind.out.pid</replaceable></screen>
+
+<para>
+This will open a window showing the data accesses. Green and blue dots show
+read and write accesses respectively; turquoise shows pixels where both reads
+and writes occur. The X axis shows address, while the Y axis shows the
+accesses in sequence.
+</para>
+
+<para>
+To keep the display manageable, not all of the address space is shown.
+White vertical lines show discontinuities in the address space, where
+addresses have been omitted. Grey lines show page boundaries, and reddish
+lines show cache-line boundaries (currently the page and cache-line sizes are
+hard-coded to 4096 and 64 respectively, rather than obtained from the target
+machine). The page and cache-line boundaries are only shown when the zoom
+level is sufficient to avoid them overlapping.
+</para>
+
+<para>
+In the initial view, all events and all accessed events are shown, which gives
+a good overview but makes fine details difficult to see. You can click and
+drag a rectangle (using the left mouse button) to zoom in on it. At present
+there is no way to zoom out again other than restarting dg_view.
+</para>
+
+</sect2>
+
+</sect1>
+
+<sect1 id="dg-manual.requests" xreflabel="Client requests">
+<title>Client requests</title>
+<para>Viewing the whole of space and time (well, within one process) is
+daunting, and can easily overload dg_view. Furthermore, it does not readily
+map back to meaningful variables or functions in the source code. To assist
+with these problems, a number of client requests are made available through
+the header file <filename>datagrind.h</filename>.</para>
+
+<para>To reduce the view of space, one can mark particular ranges of memory
+that are of interest, using <symbol>DATAGRIND_TRACK_RANGE</symbol>. Apart from
+the range itself, this macro takes a string for the type of the memory
+(currently unused, but may eventually be used to extract DWARF debug
+information to show structure offsets), and a <symbol>label</symbol>, which is
+a descriptive string. When the memory is freed, or simply ceases to be
+interesting, the tracking information can be released using
+<symbol>DATAGRIND_UNTRACK_RANGE</symbol>. It is not required to do this (i.e.,
+it will not cause Datagrind or dg_view to crash), but you may start tracking
+unrelated memory if the memory allocator reassigns the memory elsewhere.</para>
+
+<para>To reduce the view of time, one can mark the start and end of various
+events, using <symbol>DATAGRIND_START_EVENT</symbol> and
+<symbol>DATAGRIND_END_EVENT</symbol>. These macros simply take a label.</para>
+
+<para>This information is simply recorded to the output file. When you run
+dg_view, you can use the options
+<option>--events=<replaceable>event1[,event2,...]</replaceable></option> and/or
+<option>--ranges=<replaceable>range1[,range2,...]</replaceable></option> to
+limit the display to memory accesses that fall within these ranges and
+events.</para>
+
+</sect1>
+
+<sect1 id="dg-manual.format" xreflabel="Datagrind output format">
+<title>Datagrind output format</title>
+<para>
+For efficiency, Datagrind uses a binary output format to record information.
+This file format is still in active development and subject to change without
+notice, and there is no guarantee that old output files will continue to be
+readable.
+</para>
+
+<sect2 id="dg-manual.format-structure" xreflabel="Output format structure">
+<title>Output format structure</title>
+<para>
+The output format consists of a sequence of records. Each record contains
+enough information for the record to be skipped without understanding it.
+Values are encoded in the target's endianness; the file contains sufficient
+information to determine the endianness, although dg_view currently does not
+support viewing a file with a different endianness to the host on which it is
+running. Similarly, all addresses and many sizes are stored using the word
+(pointer) size of the target machine, with sufficient header information to
+determine this. Again, dg_view does not yet support files with a different
+word size to the host.
+</para>
+
+<para>
+Each record begins with a byte identifying the record type. For record types
+0-127, the second byte is a length field, indicating the length of the rest of
+the record (excluding the initial two bytes). A length of 255 is reserved for
+future expansion; a reader encountering a value of 255 should abort, as it
+will not be able to determine the record size. For record types 128-255, the
+record type is followed by a single byte of payload, giving a two-byte record.
+The numeric values of the record types can be found in
+<filename>dg_record.h</filename>.
+</para>
+
+<para>
+Strings are null-terminated. The character set and encoding generally depends
+on the C code that defines the string, but UTF-8 is recommended.
+</para>
+
+<para>
+Records are described with a C-like notation, but these structures will not
+actually be usable for accessing the file, because the file does not contain
+any padding between fields (thus, many fields are not aligned).
+</para>
+
+</sect2>
+
+<sect2 id="dg-manual.record-header" xreflabel="Header">
+<title>Header</title>
+<para>
+The first record in the file is a header record. This is the only place the
+header record may appear. The signature identifies the general structure of
+the file, and readers that recognise this signature can be confident of
+parsing the file, with the exception of values that are specifically reserved
+(such as a record length of 255), and unknown record types.
+</para>
+<screen><![CDATA[
+struct header
+{
+    byte record_type;   // DG_R_HEADER
+    byte record_length;
+    char signature[11] = "DATAGRIND1\0";
+    byte version;
+    byte endian;        // 0 for little-endian, 1 for big-endian
+    byte word_size;
+};]]>
+</screen>
+</sect2>
+
+<sect2 id="dg-manual.record-access" xreflabel="Data access">
+<title>Access</title>
+<para>
+These are the main record types, indicating a read or write access.
+</para>
+<screen><![CDATA[
+struct access
+{
+    byte record_type;   // DG_R_READ or DG_R_WRITE
+    byte record_length;
+    byte access_size;
+    word address;
+};]]>
+</screen>
+</sect2>
+
+<sect2 id="dg-manual.record-range" xreflabel="Range requests">
+<title>Range requests</title>
+<para>Client requests for range tracking are recorded as records as well. The
+strings passed by the client will be truncated to ensure that the record is
+strictly less than 255 bytes long.</para>
+<screen><![CDATA[
+struct track_range
+{
+    byte record_type;   // DG_R_TRACK_RANGE
+    byte record_length;
+    word address;
+    word length;
+    string type_name;
+    string label;
+};
+
+struct untrack_range
+{
+    byte record_type;   // DG_R_UNTRACK_RANGE
+    byte record_length;
+    word address;
+    word length;
+};]]>
+</screen>
+</sect2>
+
+<sect2 id="dg-manual.record-event" xreflabel="Event requests">
+<title>Event requests</title>
+<para>Like range requests, client requests for event tracking are recorded.
+The label is truncated to ensure that the record is less than 255 bytes long.
+</para>
+<screen><![CDATA[
+struct event
+{
+    byte record_type;   // DG_R_START_EVENT or DG_R_END_EVENT
+    byte record_length;
+    string label;
+};]]>
+</screen>
+</sect2>
+
+</sect1>
+
+</chapter>

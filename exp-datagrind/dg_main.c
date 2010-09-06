@@ -63,7 +63,7 @@ static Int out_fd = -1;
 static Char out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
 
-static Char *clo_datagrind_out_file = "datagrind.out";
+static Char *clo_datagrind_out_file = "datagrind.out.%p";
 
 static Bool dg_process_cmd_line_option(Char *arg)
 {
