@@ -33,5 +33,6 @@
 #define DG_R_UNTRACK_RANGE    4
 #define DG_R_START_EVENT      5
 #define DG_R_END_EVENT        6
+#define DG_R_INSTR            7
 
 #endif /* __DG_RECORD_H */

@@ -44,7 +44,8 @@
 typedef enum
 {
    EventType_Dr,
-   EventType_Dw
+   EventType_Dw,
+   EventType_Ir
 } EventType;
 
 typedef struct
@@ -63,11 +64,13 @@ static Int out_fd = -1;
 static Char out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
 
+static Bool clo_datagrind_trace_instr = True;
 static Char *clo_datagrind_out_file = "datagrind.out.%p";
 
 static Bool dg_process_cmd_line_option(Char *arg)
 {
    if (VG_STR_CLO(arg, "--datagrind-out-file", clo_datagrind_out_file)) {}
+   else if (VG_BOOL_CLO(arg, "--datagrind-track-instr", clo_datagrind_trace_instr)) {}
    else
        return False;
    return True;
@@ -77,6 +80,7 @@ static void dg_print_usage(void)
 {
    VG_(printf)(
 "    --datagrind-out-file=<file>      output file name [datagrind.out]\n"
+"    --datagrind-trace-instr=yes|no   trace instructions [yes]\n"
    );
 }
 
@@ -135,6 +139,11 @@ static VG_REGPARM(2) void trace_Dw(Addr addr, SizeT size)
    trace_access(addr, size, DG_R_WRITE);
 }
 
+static VG_REGPARM(2) void trace_Ir(Addr addr, SizeT size)
+{
+   trace_access(addr, size, DG_R_INSTR);
+}
+
 static void flushEvents(IRSB *sb)
 {
    Int i;
@@ -142,10 +151,11 @@ static void flushEvents(IRSB *sb)
    {
       const Char *name;
       void *fn;
-   } helpers[2] =
+   } helpers[3] =
    {
       { "trace_Dr", &trace_Dr },
-      { "trace_Dw", &trace_Dw }
+      { "trace_Dw", &trace_Dw },
+      { "trace_Ir", &trace_Ir }
    };
 
    for (i = 0; i < nevents; i++)
@@ -183,6 +193,11 @@ static void addEvent_Dr(IRSB *sb, IRExpr *daddr, Int dsize)
 static void addEvent_Dw(IRSB *sb, IRExpr *daddr, Int dsize)
 {
    addEvent(sb, daddr, dsize, EventType_Dw);
+}
+
+static void addEvent_Ir(IRSB *sb, IRExpr *iaddr, Int isize)
+{
+   addEvent(sb, iaddr, isize, EventType_Ir);
 }
 
 static void prepare_out_file(void)
@@ -258,10 +273,16 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_Put:
          case Ist_PutI:
          case Ist_MBE:
-         case Ist_IMark:
             break;
          case Ist_Exit:
             flushEvents(sbOut);
+            break;
+         case Ist_IMark:
+            if (clo_datagrind_trace_instr)
+            {
+                addEvent_Ir(sbOut, mkIRExpr_HWord((HWord) st->Ist.IMark.addr),
+                            st->Ist.IMark.len);
+            }
             break;
          case Ist_WrTmp:
             {
