@@ -23,17 +23,38 @@ typedef enum
 {
     ACCESS_TYPE_READ,
     ACCESS_TYPE_WRITE,
+    ACCESS_TYPE_INSTR
 } access_type;
 
 struct mem_access
 {
+    HWord iaddr;
     HWord addr;
     uint8_t size;
     access_type type;
     uint64_t seq;
 
     mem_access() {}
-    mem_access(HWord addr, uint8_t size, access_type type, uint64_t seq) : addr(addr), size(size), type(type), seq(seq) {}
+    mem_access(HWord iaddr, HWord addr, uint8_t size, access_type type, uint64_t seq)
+        : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq) {}
+};
+
+struct compare_mem_access_seq
+{
+    bool operator()(const mem_access &a, const mem_access &b) const
+    {
+        return a.seq < b.seq;
+    }
+
+    bool operator()(const mem_access &a, uint64_t seq) const
+    {
+        return a.seq < seq;
+    }
+
+    bool operator()(uint64_t seq, const mem_access &a) const
+    {
+        return seq < a.seq;
+    }
 };
 
 #define PAGE_SIZE 4096
@@ -51,12 +72,24 @@ static set<string> chosen_ranges;
 
 static vector<mem_access> accesses;
 static map<HWord, size_t> page_map;
+static map<size_t, HWord> rev_page_map;
 
 static GLuint num_vertices;
 
 template<typename T> T page_round_down(T x)
 {
     return x & ~(PAGE_SIZE - 1);
+}
+
+static HWord seq_to_iaddr(uint64_t seq)
+{
+    compare_mem_access_seq cmp;
+    vector<mem_access>::const_iterator pos = upper_bound(accesses.begin(), accesses.end(), seq, cmp);
+
+    if (pos == accesses.begin())
+        return 0;
+    --pos;
+    return pos->iaddr;
 }
 
 static void load(const char *filename)
@@ -67,6 +100,7 @@ static void load(const char *filename)
     unsigned int body_size = 0;
     bool first = true;
     size_t seq = 0;
+    HWord iaddr = 0;
 
     FILE *f = fopen(filename, "r");
     if (!f)
@@ -144,6 +178,7 @@ static void load(const char *filename)
                     goto bad_record;
                 case DG_R_READ:
                 case DG_R_WRITE:
+                case DG_R_INSTR:
                     {
                         if (len != 1 + sizeof(HWord))
                         {
@@ -153,6 +188,8 @@ static void load(const char *filename)
                         uint8_t size = body[0];
                         HWord addr;
                         memcpy(&addr, body + 1, sizeof(addr));
+                        if (type == DG_R_INSTR)
+                            iaddr = addr;
 
                         bool matched;
                         if (!chosen_events.empty() && active_events.empty())
@@ -173,7 +210,20 @@ static void load(const char *filename)
                             matched = true;
                         if (matched)
                         {
-                            accesses.push_back(mem_access(addr, size, type == DG_R_READ ? ACCESS_TYPE_READ : ACCESS_TYPE_WRITE, seq));
+                            access_type atype;
+                            switch (type)
+                            {
+                            case DG_R_READ:
+                                atype = ACCESS_TYPE_READ;
+                                break;
+                            case DG_R_WRITE:
+                                atype = ACCESS_TYPE_WRITE;
+                                break;
+                            case DG_R_INSTR:
+                                atype = ACCESS_TYPE_INSTR;
+                                break;
+                            }
+                            accesses.push_back(mem_access(iaddr, addr, size, atype, seq));
                             page_map[page_round_down(addr)] = 0;
                         }
                         seq++;
@@ -271,6 +321,7 @@ bad_file:
     {
         i->second = remapped_base;
         remapped_base += PAGE_SIZE;
+        rev_page_map[i->second] = i->first;
     }
 }
 
@@ -311,6 +362,7 @@ static void init_gl(void)
     GLuint vbo;
     GLubyte color_read[4] = {0, 255, 0, 255};
     GLubyte color_write[4] = {0, 0, 255, 255};
+    GLubyte color_instr[4] = {255, 0, 0, 255};
     vertex *start = NULL;
     num_vertices = count_access_bytes();
 
@@ -335,12 +387,14 @@ static void init_gl(void)
             case ACCESS_TYPE_WRITE:
                 memcpy(vertices[v].color, color_write, sizeof(color_write));
                 break;
+            case ACCESS_TYPE_INSTR:
+                memcpy(vertices[v].color, color_instr, sizeof(color_instr));
+                break;
             }
             v++;
         }
     }
     assert(v == num_vertices);
-    vector<mem_access>().swap(accesses); // free memory for accesses
 
     glGenBuffers(1, &vbo);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -370,6 +424,8 @@ static void init_gl(void)
 
     min_y = vertices[0].pos[1] - 1.0f;
     max_y = vertices.back().pos[1] + 1.0f;
+    min_x -= 0.5f;
+    max_x += 0.5f;
 
     if (glGetError() != GL_NO_ERROR)
     {
@@ -436,11 +492,25 @@ static void mouse(int button, int state, int x, int y)
             GLfloat x2 = min_x + (x + 0.5) * (max_x - min_x) / window_width;
             GLfloat y2 = min_y + (y + 0.5) * (max_y - min_y) / window_height;
 
-            min_x = min(x1, x2);
-            max_x = max(x1, x2);
-            min_y = min(y1, y2);
-            max_y = max(y1, y2);
+            min_x = min(x1, x2) - 0.5f;
+            max_x = max(x1, x2) + 0.5f;
+            min_y = min(y1, y2) - 0.5f;
+            max_y = max(y1, y2) + 0.5f;
             glutPostRedisplay();
+        }
+        else
+        {
+            HWord remapped = (HWord) (0.5 + (GLdouble) (x + 0.5f) / window_width * (max_x - min_x) + min_x);
+            HWord remapped_page = page_round_down(remapped);
+            HWord page = rev_page_map[remapped_page];
+            HWord addr = (remapped - remapped_page) + page;
+
+            uint64_t seq = (uint64_t) (0.5 + (GLdouble) (y + 0.5f) / window_height + (max_y - min_y) + min_y);
+            HWord iaddr = seq_to_iaddr(seq);
+
+            printf("%#zx at %#zx\n", addr, iaddr);
+
+
         }
     }
 }
