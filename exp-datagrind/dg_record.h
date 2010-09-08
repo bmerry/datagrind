@@ -35,5 +35,7 @@
 #define DG_R_END_EVENT        6
 #define DG_R_INSTR            7
 #define DG_R_TEXT_AVMA        8
+#define DG_R_MALLOC_BLOCK     9
+#define DG_R_FREE_BLOCK      10
 
 #endif /* __DG_RECORD_H */
