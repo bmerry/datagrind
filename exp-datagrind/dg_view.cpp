@@ -1,9 +1,32 @@
+/*
+   This file is part of Datagrind, a tool for tracking data accesses.
+
+   Copyright (C) 2010 Bruce Merry
+      bmerry@users.sourceforge.net
+
+   This program is free software; you can redistribute it and/or
+   modify it under the terms of the GNU General Public License as
+   published by the Free Software Foundation; either version 2 of the
+   License, or (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+   General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+   02111-1307, USA.
+
+   The GNU General Public License is contained in the file COPYING.
+*/
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <cassert>
-#include <sstream>
 #include <stdint.h>
 #include <GL/glew.h>
 #include <GL/glut.h>
@@ -13,13 +36,13 @@
 #include <set>
 #include <map>
 #include <string>
-#include <bfd.h>
 
 #include "dg_record.h"
+#include "dg_view.h"
+#include "dg_view_range.h"
+#include "dg_view_debuginfo.h"
 
 using namespace std;
-
-typedef uintptr_t HWord;
 
 typedef enum
 {
@@ -28,6 +51,14 @@ typedef enum
     ACCESS_TYPE_INSTR
 } access_type;
 
+struct mem_block
+{
+    HWord addr;
+    HWord size;
+    vector<HWord> stack_trace;
+    string label;
+};
+
 struct mem_access
 {
     HWord iaddr;
@@ -35,173 +66,12 @@ struct mem_access
     uint8_t size;
     access_type type;
     uint64_t seq;
+    mem_block *block;
 
     mem_access() {}
-    mem_access(HWord iaddr, HWord addr, uint8_t size, access_type type, uint64_t seq)
-        : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq) {}
+    mem_access(HWord iaddr, HWord addr, uint8_t size, access_type type, uint64_t seq, mem_block *block)
+        : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq), block(block) {}
 };
-
-struct mem_block
-{
-    HWord addr;
-    HWord size;
-    vector<HWord> stacktrace;
-};
-
-struct object_file
-{
-    HWord text_avma;
-    bfd *abfd[2];                /* Main file and .gnu_debuglink */
-    vector<asymbol *> syms[2];
-
-    object_file() : text_avma(0)
-    {
-        abfd[0] = abfd[1] = NULL;
-    }
-};
-
-static map<string, object_file> object_files;
-
-/* Loads either the main file or the .gnu_debuglink file */
-static bool load_single_object_file(const char *filename, bfd *&abfd, vector<asymbol *> &syms)
-{
-    char **matching;
-    long symcount = 0, storage;
-
-    abfd = bfd_openr(filename, NULL);
-    if (!abfd)
-        return false;
-    if (!bfd_check_format_matches(abfd, bfd_object, &matching))
-        goto bad_close;
-
-    storage = bfd_get_symtab_upper_bound(abfd);
-    if (storage > 0)
-    {
-        syms.resize(storage);
-        symcount = bfd_canonicalize_symtab(abfd, &syms[0]);
-    }
-
-    if (symcount == 0)
-    {
-        storage = bfd_get_dynamic_symtab_upper_bound(abfd);
-        if (storage > 0)
-        {
-            syms.resize(storage);
-            symcount = bfd_canonicalize_dynamic_symtab(abfd, &syms[0]);
-        }
-    }
-    if (symcount <= 0)
-        goto bad_close;
-
-    return true;
-
-bad_close:
-    bfd_close(abfd);
-    abfd = NULL;
-    return false;
-}
-
-static void load_object_file(const char *filename, HWord text_avma)
-{
-    vector<asymbol *> syms;
-    bfd *abfd = NULL;
-
-    if (load_single_object_file(filename, abfd, syms))
-    {
-        object_file &of = object_files[filename];
-        if (of.abfd[0] != NULL)
-            bfd_close(of.abfd[0]);
-        of.text_avma = text_avma;
-        of.abfd[0] = abfd;
-        of.syms[0].swap(syms);
-
-        char *gnu_debuglink = bfd_follow_gnu_debuglink(abfd, "/usr/lib/debug");
-        if (gnu_debuglink != NULL)
-        {
-            if (load_single_object_file(gnu_debuglink, abfd, syms))
-            {
-                if (of.abfd[1] != NULL)
-                    bfd_close(of.abfd[1]);
-                of.syms[1].swap(syms);
-                of.abfd[1] = abfd;
-            }
-            free(gnu_debuglink);
-        }
-    }
-}
-
-struct addr2line_info
-{
-    HWord addr;
-    object_file *obj;
-    int pass;
-    bool found;
-    const char *file_name;
-    const char *function_name;
-    unsigned int line;
-};
-
-static void addr2line_section(bfd *abfd, asection *sect, void *arg)
-{
-    addr2line_info *info = (addr2line_info *) arg;
-
-    if (info->found)
-        return;
-    if ((bfd_get_section_flags(abfd, sect) & SEC_ALLOC) == 0)
-        return;
-
-    bfd_size_type size = bfd_get_section_size(sect);
-    if (info->addr >= info->obj->text_avma + size)
-        return;
-
-    info->found = bfd_find_nearest_line(abfd, sect, &info->obj->syms[info->pass][0],
-                                        info->addr - info->obj->text_avma,
-                                        &info->file_name, &info->function_name,
-                                        &info->line);
-}
-
-static string addr2line(HWord addr)
-{
-    ostringstream label;
-    label << hex << showbase << addr << dec << noshowbase;
-    for (map<string, object_file>::iterator i = object_files.begin(); i != object_files.end(); ++i)
-    {
-        object_file &of = i->second;
-        if (addr >= of.text_avma)
-        {
-            addr2line_info info;
-
-            info.addr = addr;
-            info.obj = &of;
-            info.found = false;
-            for (info.pass = 1; info.pass >= 0; info.pass--)
-            {
-                if (of.abfd[info.pass] == NULL) continue;
-                bfd_map_over_sections(of.abfd[info.pass], addr2line_section, &info);
-                if (info.found)
-                {
-                    if (info.function_name != NULL && info.function_name[0])
-                        label << " in " << info.function_name;
-                    label << " (";
-                    if (info.file_name)
-                    {
-                        const char *suffix = strrchr(info.file_name, '/');
-                        if (suffix == NULL)
-                            suffix = info.file_name;
-                        else
-                            suffix++; /* Skip over the last / */
-                        label << suffix << ":" << info.line;
-                    }
-                    else
-                        label << i->first;
-                    label << ")";
-                    return label.str();
-                }
-            }
-        }
-    }
-    return label.str();
-}
 
 struct compare_mem_access_seq
 {
@@ -221,15 +91,16 @@ struct compare_mem_access_seq
     }
 };
 
-#define PAGE_SIZE 4096
-#define LINE_SIZE 64
+#define DG_VIEW_PAGE_SIZE 4096
+#define DG_VIEW_LINE_SIZE 64
 
 /* All START_EVENTs with no matching END_EVENT from chosen_events */
 static multiset<string> active_events;
 /* All TRACK_RANGEs with no matching UNTRACK_RANGE from chosen_ranges */
 static multiset<pair<HWord, HWord> > active_ranges;
 
-static map<HWord, mem_block> block_map;
+static rangemap<HWord, mem_block *> block_map;
+static vector<mem_block *> block_storage;
 
 /* Events selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_events;
@@ -244,7 +115,7 @@ static GLuint num_vertices;
 
 template<typename T> T page_round_down(T x)
 {
-    return x & ~(PAGE_SIZE - 1);
+    return x & ~(DG_VIEW_PAGE_SIZE - 1);
 }
 
 static HWord seq_to_iaddr(uint64_t seq)
@@ -256,6 +127,57 @@ static HWord seq_to_iaddr(uint64_t seq)
         return 0;
     --pos;
     return pos->iaddr;
+}
+
+static vector<mem_access>::iterator nearest_access(double addr, double seq, double addr_scale, double seq_scale)
+{
+    /* Start at the right instruction and search outwards until we can bound
+     * the search.
+     */
+    vector<mem_access>::iterator back, forw, best;
+    double best_score = HUGE_VAL;
+
+    forw = lower_bound(accesses.begin(), accesses.end(), (uint64_t) seq, compare_mem_access_seq());
+    back = forw;
+    best = forw;
+    while (forw != accesses.end() || back != accesses.begin())
+    {
+        if (forw != accesses.end())
+        {
+            double seq_score = (forw->seq - seq) * seq_scale;
+            if (seq_score > best_score)
+                forw = accesses.end();
+            else
+            {
+                double addr_score = (forw->addr - addr) * addr_scale;
+                double score = hypot(addr_score, seq_score);
+                if (score < best_score)
+                {
+                    best_score = score;
+                    best = forw;
+                }
+                ++forw;
+            }
+        }
+        if (back != accesses.begin())
+        {
+            --back;
+            double seq_score = (seq - back->seq) * seq_scale;
+            if (seq_scale > best_score)
+                back = accesses.begin();
+            else
+            {
+                double addr_score = (back->addr - addr) * addr_scale;
+                double score = hypot(addr_score, seq_score);
+                if (score < best_score)
+                {
+                    best_score = score;
+                    best = back;
+                }
+            }
+        }
+    }
+    return best;
 }
 
 static void load(const char *filename)
@@ -355,7 +277,11 @@ static void load(const char *filename)
                         HWord addr;
                         memcpy(&addr, body + 1, sizeof(addr));
                         if (type == DG_R_INSTR)
+                        {
                             iaddr = addr;
+                            seq++;
+                            break;
+                        }
 
                         bool matched;
                         if (!chosen_events.empty() && active_events.empty())
@@ -389,7 +315,12 @@ static void load(const char *filename)
                                 atype = ACCESS_TYPE_INSTR;
                                 break;
                             }
-                            accesses.push_back(mem_access(iaddr, addr, size, atype, seq));
+
+                            mem_block *block = NULL;
+                            rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
+                            if (block_it != block_map.end())
+                                block = block_it->second;
+                            accesses.push_back(mem_access(iaddr, addr, size, atype, seq, block));
                             page_map[page_round_down(addr)] = 0;
                         }
                         seq++;
@@ -467,13 +398,18 @@ static void load(const char *filename)
                           fprintf(stderr, "Error: record is wrong size");
                           goto bad_record;
                        }
-                       printf("%#lx (size %#lx) allocated at\n", addr, size);
+
+                       mem_block *block = new mem_block;
+                       block->addr = addr;
+                       block->size = size;
                        for (HWord i = 0; i < n_ips; i++)
                        {
                           HWord stack_addr;
                           memcpy(&stack_addr, body + (i + 3) * sizeof(HWord), sizeof(HWord));
-                          printf("  %s\n", addr2line(stack_addr).c_str());
+                          block->stack_trace.push_back(stack_addr);
                        }
+                       block_storage.push_back(block);
+                       block_map.insert(addr, addr + size, block);
                     }
                     break;
                 case DG_R_FREE_BLOCK:
@@ -486,6 +422,7 @@ static void load(const char *filename)
                             goto bad_record;
                         }
                         memcpy(&addr, body, sizeof(addr));
+                        block_map.erase(addr);
                     }
                     break;
                 case DG_R_START_EVENT:
@@ -546,7 +483,7 @@ bad_file:
     for (map<HWord, size_t>::iterator i = page_map.begin(); i != page_map.end(); i++)
     {
         i->second = remapped_base;
-        remapped_base += PAGE_SIZE;
+        remapped_base += DG_VIEW_PAGE_SIZE;
         rev_page_map[i->second] = i->first;
     }
 }
@@ -672,22 +609,22 @@ static void display(void)
     glBegin(GL_LINES);
     for (map<HWord, size_t>::const_iterator i = page_map.begin(); i != page_map.end(); ++i)
     {
-        if (i->first != last + PAGE_SIZE)
+        if (i->first != last + DG_VIEW_PAGE_SIZE)
         {
             glColor4ub(192, 192, 192, 0);
             glVertex2f(i->second, min_y);
             glVertex2f(i->second, max_y);
         }
-        else if (xrate < PAGE_SIZE / 8)
+        else if (xrate < DG_VIEW_PAGE_SIZE / 8)
         {
             glColor4ub(64, 64, 64, 0);
             glVertex2f(i->second, min_y);
             glVertex2f(i->second, max_y);
         }
-        if (xrate < LINE_SIZE / 8)
+        if (xrate < DG_VIEW_LINE_SIZE / 8)
         {
             glColor4ub(96, 32, 32, 0);
-            for (int j = LINE_SIZE; j < PAGE_SIZE; j += LINE_SIZE)
+            for (int j = DG_VIEW_LINE_SIZE; j < DG_VIEW_PAGE_SIZE; j += DG_VIEW_LINE_SIZE)
             {
                 glVertex2f(i->second + j, min_y);
                 glVertex2f(i->second + j, max_y);
@@ -729,12 +666,37 @@ static void mouse(int button, int state, int x, int y)
             HWord remapped = (HWord) (0.5 + (GLdouble) (x + 0.5f) / window_width * (max_x - min_x) + min_x);
             HWord remapped_page = page_round_down(remapped);
             HWord page = rev_page_map[remapped_page];
+
             HWord addr = (remapped - remapped_page) + page;
+            double seq = (GLdouble) (y + 0.5f) / window_height * (max_y - min_y) + min_y;
 
-            uint64_t seq = (uint64_t) (0.5 + (GLdouble) (y + 0.5f) / window_height * (max_y - min_y) + min_y);
-            HWord iaddr = seq_to_iaddr(seq);
+            double addr_scale = window_width / (max_x - min_x);
+            double seq_scale = window_height / (max_y - min_y);
 
-            printf("%#zx at %#zx: %s\n", addr, iaddr, addr2line(iaddr).c_str());
+            vector<mem_access>::const_iterator access = nearest_access(addr, seq, addr_scale, seq_scale);
+            if (access != accesses.end())
+            {
+                printf("Nearest access: %#zx", access->addr);
+                mem_block *block = access->block;
+                if (block != NULL)
+                {
+                    printf(": %zu bytes inside a block of size %zu, allocated at\n",
+                           addr - block->addr, block->size);
+                    for (size_t i = 0; i < block->stack_trace.size(); i++)
+                    {
+                        string loc = addr2line(block->stack_trace[i]);
+                        printf("  %s\n", loc.c_str());
+                    }
+                }
+                else
+                    printf("\n");
+
+                if (access->iaddr != 0)
+                {
+                    string loc = addr2line(access->iaddr);
+                    printf("At %s\n", loc.c_str());
+                }
+            }
         }
     }
 }
