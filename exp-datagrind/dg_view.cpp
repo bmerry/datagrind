@@ -41,6 +41,13 @@ struct mem_access
         : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq) {}
 };
 
+struct mem_block
+{
+    HWord addr;
+    HWord size;
+    vector<HWord> stacktrace;
+};
+
 struct object_file
 {
     HWord text_avma;
@@ -155,6 +162,8 @@ static void addr2line_section(bfd *abfd, asection *sect, void *arg)
 
 static string addr2line(HWord addr)
 {
+    ostringstream label;
+    label << hex << showbase << addr << dec << noshowbase;
     for (map<string, object_file>::iterator i = object_files.begin(); i != object_files.end(); ++i)
     {
         object_file &of = i->second;
@@ -171,21 +180,27 @@ static string addr2line(HWord addr)
                 bfd_map_over_sections(of.abfd[info.pass], addr2line_section, &info);
                 if (info.found)
                 {
-                    ostringstream label;
                     if (info.function_name != NULL && info.function_name[0])
-                        label << info.function_name;
-                    else
-                        label << "??";
+                        label << " in " << info.function_name;
                     label << " (";
                     if (info.file_name)
-                        label << info.file_name << ":" << info.line << " in ";
-                    label << i->first << ")";
+                    {
+                        const char *suffix = strrchr(info.file_name, '/');
+                        if (suffix == NULL)
+                            suffix = info.file_name;
+                        else
+                            suffix++; /* Skip over the last / */
+                        label << suffix << ":" << info.line;
+                    }
+                    else
+                        label << i->first;
+                    label << ")";
                     return label.str();
                 }
             }
         }
     }
-    return "??";
+    return label.str();
 }
 
 struct compare_mem_access_seq
@@ -213,6 +228,8 @@ struct compare_mem_access_seq
 static multiset<string> active_events;
 /* All TRACK_RANGEs with no matching UNTRACK_RANGE from chosen_ranges */
 static multiset<pair<HWord, HWord> > active_ranges;
+
+static map<HWord, mem_block> block_map;
 
 /* Events selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_events;
@@ -429,6 +446,46 @@ static void load(const char *filename)
                         multiset<pair<HWord, HWord> >::iterator it = active_ranges.find(key);
                         if (it != active_ranges.end())
                             active_ranges.erase(it);
+                    }
+                    break;
+                case DG_R_MALLOC_BLOCK:
+                    {
+                       HWord addr;
+                       HWord size;
+                       HWord n_ips;
+                       vector<HWord> ips;
+                       if (len < 3 * sizeof(HWord))
+                       {
+                          fprintf(stderr, "Error: record is too short");
+                          goto bad_record;
+                       }
+                       memcpy(&addr, body, sizeof(addr));
+                       memcpy(&size, body + sizeof(addr), sizeof(size));
+                       memcpy(&n_ips, body + 2 * sizeof(addr), sizeof(n_ips));
+                       if (len != (n_ips + 3) * sizeof(HWord))
+                       {
+                          fprintf(stderr, "Error: record is wrong size");
+                          goto bad_record;
+                       }
+                       printf("%#lx (size %#lx) allocated at\n", addr, size);
+                       for (HWord i = 0; i < n_ips; i++)
+                       {
+                          HWord stack_addr;
+                          memcpy(&stack_addr, body + (i + 3) * sizeof(HWord), sizeof(HWord));
+                          printf("  %s\n", addr2line(stack_addr).c_str());
+                       }
+                    }
+                    break;
+                case DG_R_FREE_BLOCK:
+                    {
+                        HWord addr;
+
+                        if (len != sizeof(addr))
+                        {
+                            fprintf(stderr, "Error: record is wrong size");
+                            goto bad_record;
+                        }
+                        memcpy(&addr, body, sizeof(addr));
                     }
                     break;
                 case DG_R_START_EVENT:

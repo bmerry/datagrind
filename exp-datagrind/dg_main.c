@@ -38,6 +38,8 @@
 #include "pub_tool_libcbase.h"
 #include "pub_tool_libcfile.h"
 #include "pub_tool_debuginfo.h"
+#include "pub_tool_stacktrace.h"
+#include "pub_tool_replacemalloc.h"
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"
 
@@ -61,8 +63,18 @@ typedef struct
 typedef struct
 {
    VgHashNode header;
-} DGDebugInfo;
+} DgDebugInfo;
 
+typedef struct
+{
+   VgHashNode header;
+   SizeT szB;
+   SizeT actual_szB;
+   UInt n_ips;
+   StackTrace ips;
+} DgMallocBlock;
+
+#define STACK_DEPTH 4
 #define NEVENTS 4
 #define OUT_BUF_SIZE 4096
 
@@ -75,6 +87,8 @@ static UInt out_buf_used = 0;
 static VgHashTable debuginfo_table = NULL;
 static Bool debuginfo_dirty = True;
 
+static VgHashTable block_table = NULL;
+
 static Bool clo_datagrind_trace_instr = True;
 static Char *clo_datagrind_out_file = "datagrind.out.%p";
 
@@ -82,6 +96,7 @@ static Bool dg_process_cmd_line_option(Char *arg)
 {
    if (VG_STR_CLO(arg, "--datagrind-out-file", clo_datagrind_out_file)) {}
    else if (VG_BOOL_CLO(arg, "--datagrind-track-instr", clo_datagrind_trace_instr)) {}
+   else if (VG_(replacement_malloc_process_cmd_line_option)(arg)) {}
    else
        return False;
    return True;
@@ -104,6 +119,8 @@ static void dg_print_debug_usage(void)
 
 static void dg_post_clo_init(void)
 {
+   debuginfo_table = VG_(HT_construct)("datagrind.debuginfo_table");
+   block_table = VG_(HT_construct)("datagrind.block_table");
 }
 
 static void out_flush(void)
@@ -253,21 +270,15 @@ static void clean_debuginfo(void)
    {
       const DebugInfo *di = VG_(next_DebugInfo)(NULL);
 
-      if (debuginfo_table == NULL)
-      {
-         debuginfo_table = VG_(HT_construct)("debuginfo_table");
-      }
-
       for (; di != NULL; di = VG_(next_DebugInfo)(di))
       {
          const UChar *filename = VG_(DebugInfo_get_filename)(di);
          Addr text_avma = VG_(DebugInfo_get_text_avma)(di);
-         PtrdiffT text_bias = VG_(DebugInfo_get_text_bias)(di);
          SizeT filename_len = VG_(strlen)(filename);
 
          if (!VG_(HT_lookup)(debuginfo_table, (UWord) di))
          {
-            DGDebugInfo *node = VG_(calloc)("debuginfo_table.node", 1, sizeof(DGDebugInfo));
+            DgDebugInfo *node = VG_(calloc)("debuginfo_table.node", 1, sizeof(DgDebugInfo));
             node->header.key = (UWord) di;
             VG_(HT_add_node)(debuginfo_table, node);
 
@@ -386,19 +397,170 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
    return sbOut;
 }
 
-static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
+static void log_add_block(DgMallocBlock* block)
 {
-   if (!VG_IS_TOOL_USERREQ('D', 'G', args[0]))
+   UInt i;
+   out_byte(DG_R_MALLOC_BLOCK);
+   out_byte((block->n_ips + 3) * sizeof(Addr));
+   out_word(block->header.key); /* addr */
+   out_word(block->szB);
+   out_word(block->n_ips);
+
+   for (i = 0; i < block->n_ips; i++)
+      out_word(block->ips[i]);
+}
+
+static void log_remove_block(DgMallocBlock* block)
+{
+   out_byte(DG_R_FREE_BLOCK);
+   out_byte(sizeof(Addr));
+   out_word(block->header.key); /* addr */
+}
+
+static void add_block(ThreadId tid, void* p, SizeT szB, Bool custom)
+{
+   StackTrace ips = VG_(calloc)("datagrind.add_block.stacktrace", STACK_DEPTH, sizeof(Addr));
+   DgMallocBlock* block = VG_(calloc)("datagrind.add_block.block", 1, sizeof(DgMallocBlock));
+
+   block->header.key = (UWord) p;
+   block->szB = szB;
+   if (!custom)
+      block->actual_szB = VG_(malloc_usable_size)(p);
+   else
+      block->actual_szB = szB;
+
+   block->n_ips = VG_(get_StackTrace)(tid, ips, STACK_DEPTH, NULL, NULL, 0);
+   block->ips = ips;
+
+   VG_(HT_add_node)(block_table, block);
+
+   log_add_block(block);
+}
+
+/* Returns true if the block was found */
+static Bool remove_block(void* p)
+{
+   DgMallocBlock* block = VG_(HT_remove)(block_table, (UWord) p);
+   if (block == NULL)
       return False;
 
+   log_remove_block(block);
+
+   VG_(free)(block->ips);
+   VG_(free)(block);
+   return True;
+}
+
+static void* dg_malloc(ThreadId tid, SizeT szB)
+{
+   void* p = VG_(cli_malloc)(VG_(clo_alignment), szB);
+   if (p != NULL)
+      add_block(tid, p, szB, False);
+   return p;
+}
+
+static void* dg_calloc(ThreadId tid, SizeT m, SizeT szB)
+{
+   if (m > (~(SizeT) 0) / szB)
+      return NULL;
+   else
+   {
+      void* p;
+      szB *= m;
+      p = VG_(cli_malloc)(VG_(clo_alignment), szB);
+      if (p != NULL)
+      {
+         VG_(memset)(p, 0, szB);
+         add_block(tid, p, szB, False);
+      }
+      return p;
+   }
+}
+
+static void* dg_memalign(ThreadId tid, SizeT alignB, SizeT szB)
+{
+   void* p = VG_(cli_malloc)(alignB, szB);
+   if (p != NULL)
+      add_block(tid, p, szB, False);
+   return p;
+}
+
+static void dg_free(ThreadId tid, void* p)
+{
+   if (remove_block(p))
+      VG_(cli_free)(p);
+}
+
+static void* dg_realloc(ThreadId tid, void* p, SizeT szB)
+{
+   DgMallocBlock* block = VG_(HT_lookup)(block_table, (UWord) p);
+
+   if (block == NULL)
+      return NULL;  /* bogus realloc - the wrapper handles the corner cases */
+
+   if (szB <= block->actual_szB)
+   {
+      /* No need to resize. */
+      log_remove_block(block);
+      block->szB = szB;
+      block->n_ips = VG_(get_StackTrace)(tid, block->ips, STACK_DEPTH, NULL, NULL, 0);
+      log_add_block(block);
+      return p;
+   }
+   else
+   {
+      /* New size is bigger */
+      void* new_p = VG_(cli_malloc)(VG_(clo_alignment), szB);
+      if (new_p == NULL)
+         return NULL;
+      VG_(memcpy)(new_p, p, block->szB);
+
+      log_remove_block(block);
+      VG_(HT_remove)(block_table, (UWord) p);
+
+      block->header.key = (UWord) new_p;
+      block->szB = szB;
+      block->actual_szB = VG_(malloc_usable_size)(new_p);
+      block->n_ips = VG_(get_StackTrace)(tid, block->ips, STACK_DEPTH, NULL, NULL, 0);
+
+      VG_(HT_add_node)(block_table, block);
+      log_add_block(block);
+      return new_p;
+   }
+}
+
+static SizeT dg_malloc_usable_size(ThreadId tid, void* p)
+{
+   DgMallocBlock* block = VG_(HT_lookup)(block_table, (UWord) p);
+   if (block == NULL)
+      return 0;
+   else
+      return block->actual_szB;
+}
+
+static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
+{
    switch (args[0])
    {
+   case VG_USERREQ__MALLOCLIKE_BLOCK:
+      {
+         void* p = (void*) args[1];
+         SizeT szB = args[2];
+         add_block(tid, p, szB, True);
+      }
+      break;
+   case VG_USERREQ__FREELIKE_BLOCK:
+      {
+         void* p = (void*) args[1];
+         remove_block(p);
+      }
+      break;
    case VG_USERREQ__TRACK_RANGE:
       {
          UWord addr = args[1];
          UWord len = args[2];
-         const Char *type = (const Char *) args[3];
-         const Char *label = (const Char *) args[4];
+         const Char* type = (const Char*) args[3];
+         const Char* label = (const Char*) args[4];
          SizeT type_len = VG_(strlen)(type);
          SizeT label_len = VG_(strlen)(label);
 
@@ -437,8 +599,10 @@ static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
       }
       break;
    default:
+      *ret = 0;
       return False;
    }
+   *ret = 0;
    return True;
 }
 
@@ -478,6 +642,20 @@ static void dg_pre_clo_init(void)
                                    dg_print_usage,
                                    dg_print_debug_usage);
    VG_(needs_client_requests)(dg_handle_client_request);
+   VG_(needs_malloc_replacement)(
+      dg_malloc,         /* malloc */
+      dg_malloc,         /* __builtin_new */
+      dg_malloc,         /* __builtin_new */
+      dg_memalign,       /* memalign */
+      dg_calloc,         /* calloc */
+      dg_free,           /* free */
+      dg_free,           /* __builtin_delete */
+      dg_free,           /* __builtin_vec_delete */
+      dg_realloc,        /* realloc */
+      dg_malloc_usable_size,
+      0                  /* red zone */
+      );
+
    VG_(track_new_mem_startup)(dg_track_new_mem_mmap_or_startup);
    VG_(track_new_mem_mmap)(dg_track_new_mem_mmap_or_startup);
 }
