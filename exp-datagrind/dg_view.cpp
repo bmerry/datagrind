@@ -44,10 +44,13 @@ struct mem_access
 struct object_file
 {
     HWord text_avma;
-    bfd *abfd;                /* Main file and .gnu_debuglink */
-    vector<asymbol *> syms;
+    bfd *abfd[2];                /* Main file and .gnu_debuglink */
+    vector<asymbol *> syms[2];
 
-    object_file() : text_avma(0), abfd(NULL) {}
+    object_file() : text_avma(0)
+    {
+        abfd[0] = abfd[1] = NULL;
+    }
 };
 
 static map<string, object_file> object_files;
@@ -98,11 +101,24 @@ static void load_object_file(const char *filename, HWord text_avma)
     if (load_single_object_file(filename, abfd, syms))
     {
         object_file &of = object_files[filename];
-        if (of.abfd != NULL)
-            bfd_close(of.abfd);
+        if (of.abfd[0] != NULL)
+            bfd_close(of.abfd[0]);
         of.text_avma = text_avma;
-        of.abfd = abfd;
-        of.syms.swap(syms);
+        of.abfd[0] = abfd;
+        of.syms[0].swap(syms);
+
+        char *gnu_debuglink = bfd_follow_gnu_debuglink(abfd, "/usr/lib/debug");
+        if (gnu_debuglink != NULL)
+        {
+            if (load_single_object_file(gnu_debuglink, abfd, syms))
+            {
+                if (of.abfd[1] != NULL)
+                    bfd_close(of.abfd[1]);
+                of.syms[1].swap(syms);
+                of.abfd[1] = abfd;
+            }
+            free(gnu_debuglink);
+        }
     }
 }
 
@@ -110,6 +126,7 @@ struct addr2line_info
 {
     HWord addr;
     object_file *obj;
+    unsigned int pass;
     bool found;
     const char *file_name;
     const char *function_name;
@@ -129,7 +146,7 @@ static void addr2line_section(bfd *abfd, asection *sect, void *arg)
     if (info->addr >= info->obj->text_avma + size)
         return;
 
-    info->found = bfd_find_nearest_line(abfd, sect, &info->obj->syms[0],
+    info->found = bfd_find_nearest_line(abfd, sect, &info->obj->syms[info->pass][0],
                                         info->addr - info->obj->text_avma,
                                         &info->file_name, &info->function_name,
                                         &info->line);
@@ -139,26 +156,31 @@ static string addr2line(HWord addr)
 {
     for (map<string, object_file>::iterator i = object_files.begin(); i != object_files.end(); ++i)
     {
-        if (addr >= i->second.text_avma)
+        object_file &of = i->second;
+        if (addr >= of.text_avma)
         {
             addr2line_info info;
 
             info.addr = addr;
-            info.obj = &i->second;
+            info.obj = &of;
             info.found = false;
-            bfd_map_over_sections(i->second.abfd, addr2line_section, &info);
-            if (info.found)
+            for (info.pass = 0; info.pass < 2; info.pass++)
             {
-                ostringstream label;
-                if (info.function_name != NULL && info.function_name[0])
-                    label << info.function_name;
-                else
-                    label << "??";
-                label << " (";
-                if (info.file_name)
-                    label << info.file_name << ":" << info.line << " in ";
-                label << i->first << ")";
-                return label.str();
+                if (of.abfd[info.pass] == NULL) continue;
+                bfd_map_over_sections(of.abfd[info.pass], addr2line_section, &info);
+                if (info.found)
+                {
+                    ostringstream label;
+                    if (info.function_name != NULL && info.function_name[0])
+                        label << info.function_name;
+                    else
+                        label << "??";
+                    label << " (";
+                    if (info.file_name)
+                        label << info.file_name << ":" << info.line << " in ";
+                    label << i->first << ")";
+                    return label.str();
+                }
             }
         }
     }
