@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cmath>
 #include <cassert>
+#include <sstream>
 #include <stdint.h>
 #include <GL/glew.h>
 #include <GL/glut.h>
@@ -12,6 +13,7 @@
 #include <set>
 #include <map>
 #include <string>
+#include <bfd.h>
 
 #include "dg_record.h"
 
@@ -38,6 +40,130 @@ struct mem_access
     mem_access(HWord iaddr, HWord addr, uint8_t size, access_type type, uint64_t seq)
         : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq) {}
 };
+
+struct object_file
+{
+    HWord text_avma;
+    bfd *abfd;                /* Main file and .gnu_debuglink */
+    vector<asymbol *> syms;
+
+    object_file() : text_avma(0), abfd(NULL) {}
+};
+
+static map<string, object_file> object_files;
+
+/* Loads either the main file or the .gnu_debuglink file */
+static bool load_single_object_file(const char *filename, bfd *&abfd, vector<asymbol *> &syms)
+{
+    char **matching;
+    long symcount, storage;
+    bool dynamic = false;
+
+    abfd = bfd_openr(filename, NULL);
+    if (!abfd)
+        return false;
+    if (!bfd_check_format_matches(abfd, bfd_object, &matching))
+        goto bad_close;
+
+    storage = bfd_get_symtab_upper_bound(abfd);
+    if (storage == 0)
+    {
+        storage = bfd_get_dynamic_symtab_upper_bound(abfd);
+        dynamic = true;
+    }
+    if (storage < 0)
+        goto bad_close;
+
+    syms.resize(storage);
+    if (dynamic)
+        symcount = bfd_canonicalize_dynamic_symtab(abfd, &syms[0]);
+    else
+        symcount = bfd_canonicalize_symtab(abfd, &syms[0]);
+    if (symcount < 0)
+        goto bad_close;
+
+    return true;
+
+bad_close:
+    bfd_close(abfd);
+    abfd = NULL;
+    return false;
+}
+
+static void load_object_file(const char *filename, HWord text_avma)
+{
+    vector<asymbol *> syms;
+    bfd *abfd = NULL;
+
+    if (load_single_object_file(filename, abfd, syms))
+    {
+        object_file &of = object_files[filename];
+        if (of.abfd != NULL)
+            bfd_close(of.abfd);
+        of.text_avma = text_avma;
+        of.abfd = abfd;
+        of.syms.swap(syms);
+    }
+}
+
+struct addr2line_info
+{
+    HWord addr;
+    object_file *obj;
+    bool found;
+    const char *file_name;
+    const char *function_name;
+    unsigned int line;
+};
+
+static void addr2line_section(bfd *abfd, asection *sect, void *arg)
+{
+    addr2line_info *info = (addr2line_info *) arg;
+
+    if (info->found)
+        return;
+    if ((bfd_get_section_flags(abfd, sect) & SEC_ALLOC) == 0)
+        return;
+
+    bfd_size_type size = bfd_get_section_size(sect);
+    if (info->addr >= info->obj->text_avma + size)
+        return;
+
+    info->found = bfd_find_nearest_line(abfd, sect, &info->obj->syms[0],
+                                        info->addr - info->obj->text_avma,
+                                        &info->file_name, &info->function_name,
+                                        &info->line);
+}
+
+static string addr2line(HWord addr)
+{
+    for (map<string, object_file>::iterator i = object_files.begin(); i != object_files.end(); ++i)
+    {
+        if (addr >= i->second.text_avma)
+        {
+            addr2line_info info;
+
+            info.addr = addr;
+            info.obj = &i->second;
+            info.found = false;
+            bfd_map_over_sections(i->second.abfd, addr2line_section, &info);
+            if (info.found)
+            {
+                ostringstream label;
+                if (info.function_name != NULL && info.function_name[0])
+                    label << info.function_name;
+                else
+                    label << "??";
+                label << " (";
+                if (info.file_name)
+                    label << info.file_name << ":" << info.line << " in ";
+                label << i->first << ")";
+                return label.str();
+            }
+        }
+    }
+    return "??";
+}
 
 struct compare_mem_access_seq
 {
@@ -304,6 +430,26 @@ static void load(const char *filename)
                         }
                     }
                     break;
+                case DG_R_TEXT_AVMA:
+                    {
+                        HWord avma;
+
+                        if (len < 2 * sizeof(HWord) + 1)
+                        {
+                            fprintf(stderr, "Error: record has wrong size\n");
+                            goto bad_record;
+                        }
+                        memcpy(&avma, body, sizeof(avma));
+                        string filename((const char *) body + sizeof(avma));
+                        if (len != sizeof(avma) + filename.size() + 1)
+                        {
+                            fprintf(stderr, "Error: record not properly terminated\n");
+                            goto bad_record;
+                        }
+
+                        load_object_file(filename.c_str(), avma);
+                    }
+                    break;
                 default:
                     fprintf(stderr, "Warning: unknown record type %#x\n", type);
                     goto bad_record;
@@ -505,12 +651,11 @@ static void mouse(int button, int state, int x, int y)
             HWord page = rev_page_map[remapped_page];
             HWord addr = (remapped - remapped_page) + page;
 
-            uint64_t seq = (uint64_t) (0.5 + (GLdouble) (y + 0.5f) / window_height + (max_y - min_y) + min_y);
+            uint64_t seq = (uint64_t) (0.5 + (GLdouble) (y + 0.5f) / window_height * (max_y - min_y) + min_y);
             HWord iaddr = seq_to_iaddr(seq);
 
             printf("%#zx at %#zx\n", addr, iaddr);
-
-
+            printf("%s\n", addr2line(iaddr).c_str());
         }
     }
 }
