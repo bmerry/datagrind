@@ -269,8 +269,6 @@ static void clean_debuginfo(void)
          {
             DGDebugInfo *node = VG_(calloc)("debuginfo_table.node", 1, sizeof(DGDebugInfo));
             node->header.key = (UWord) di;
-            VG_(umsg)("Filename = %s\ntext_avma = %#lx\ntext_bias = %ld\n",
-                      filename, text_avma, text_bias);
             VG_(HT_add_node)(debuginfo_table, node);
 
             if (filename_len > 128) filename_len = 128;

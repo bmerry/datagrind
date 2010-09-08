@@ -59,8 +59,7 @@ static map<string, object_file> object_files;
 static bool load_single_object_file(const char *filename, bfd *&abfd, vector<asymbol *> &syms)
 {
     char **matching;
-    long symcount, storage;
-    bool dynamic = false;
+    long symcount = 0, storage;
 
     abfd = bfd_openr(filename, NULL);
     if (!abfd)
@@ -69,20 +68,22 @@ static bool load_single_object_file(const char *filename, bfd *&abfd, vector<asy
         goto bad_close;
 
     storage = bfd_get_symtab_upper_bound(abfd);
-    if (storage == 0)
+    if (storage > 0)
+    {
+        syms.resize(storage);
+        symcount = bfd_canonicalize_symtab(abfd, &syms[0]);
+    }
+
+    if (symcount == 0)
     {
         storage = bfd_get_dynamic_symtab_upper_bound(abfd);
-        dynamic = true;
+        if (storage > 0)
+        {
+            syms.resize(storage);
+            symcount = bfd_canonicalize_dynamic_symtab(abfd, &syms[0]);
+        }
     }
-    if (storage < 0)
-        goto bad_close;
-
-    syms.resize(storage);
-    if (dynamic)
-        symcount = bfd_canonicalize_dynamic_symtab(abfd, &syms[0]);
-    else
-        symcount = bfd_canonicalize_symtab(abfd, &syms[0]);
-    if (symcount < 0)
+    if (symcount <= 0)
         goto bad_close;
 
     return true;
@@ -126,7 +127,7 @@ struct addr2line_info
 {
     HWord addr;
     object_file *obj;
-    unsigned int pass;
+    int pass;
     bool found;
     const char *file_name;
     const char *function_name;
@@ -164,7 +165,7 @@ static string addr2line(HWord addr)
             info.addr = addr;
             info.obj = &of;
             info.found = false;
-            for (info.pass = 0; info.pass < 2; info.pass++)
+            for (info.pass = 1; info.pass >= 0; info.pass--)
             {
                 if (of.abfd[info.pass] == NULL) continue;
                 bfd_map_over_sections(of.abfd[info.pass], addr2line_section, &info);
@@ -456,7 +457,7 @@ static void load(const char *filename)
                     {
                         HWord avma;
 
-                        if (len < 2 * sizeof(HWord) + 1)
+                        if (len < sizeof(HWord) + 1)
                         {
                             fprintf(stderr, "Error: record has wrong size\n");
                             goto bad_record;
@@ -676,8 +677,7 @@ static void mouse(int button, int state, int x, int y)
             uint64_t seq = (uint64_t) (0.5 + (GLdouble) (y + 0.5f) / window_height * (max_y - min_y) + min_y);
             HWord iaddr = seq_to_iaddr(seq);
 
-            printf("%#zx at %#zx\n", addr, iaddr);
-            printf("%s\n", addr2line(iaddr).c_str());
+            printf("%#zx at %#zx: %s\n", addr, iaddr, addr2line(iaddr).c_str());
         }
     }
 }
