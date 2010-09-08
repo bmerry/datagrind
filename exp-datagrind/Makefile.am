@@ -21,7 +21,7 @@ dg_view_CPPFLAGS = $(AM_CPPFLAGS_PRI)
 dg_view_CFLAGS = $(AM_CFLAGS_PRI)
 dg_view_CCASFLAGS = $(AM_CCASFLAGS_PRI)
 dg_view_LDFLAGS = $(AM_LDFLAGS_PRI)
-dg_view_LDADD = -lglut -lGLEW -lGL
+dg_view_LDADD = -lglut -lGLEW -lGL -lbfd
 
 #----------------------------------------------------------------------------
 # exp-datagrind-<platform>

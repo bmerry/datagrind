@@ -31,10 +31,13 @@
 #include "pub_tool_basics.h"
 #include "pub_tool_tooliface.h"
 #include "pub_tool_vki.h"
+#include "pub_tool_hashtable.h"
+#include "pub_tool_mallocfree.h"
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
 #include "pub_tool_libcbase.h"
 #include "pub_tool_libcfile.h"
+#include "pub_tool_debuginfo.h"
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"
 
@@ -55,6 +58,11 @@ typedef struct
    Int size;
 } Event;
 
+typedef struct
+{
+   VgHashNode header;
+} DGDebugInfo;
+
 #define NEVENTS 4
 #define OUT_BUF_SIZE 4096
 
@@ -63,6 +71,9 @@ static Int nevents = 0;
 static Int out_fd = -1;
 static Char out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
+
+static VgHashTable debuginfo_table = NULL;
+static Bool debuginfo_dirty = True;
 
 static Bool clo_datagrind_trace_instr = True;
 static Char *clo_datagrind_out_file = "datagrind.out.%p";
@@ -236,6 +247,44 @@ static void prepare_out_file(void)
    }
 }
 
+static void clean_debuginfo(void)
+{
+   if (debuginfo_dirty)
+   {
+      const DebugInfo *di = VG_(next_DebugInfo)(NULL);
+
+      if (debuginfo_table == NULL)
+      {
+         debuginfo_table = VG_(HT_construct)("debuginfo_table");
+      }
+
+      for (; di != NULL; di = VG_(next_DebugInfo)(di))
+      {
+         const UChar *filename = VG_(DebugInfo_get_filename)(di);
+         Addr text_avma = VG_(DebugInfo_get_text_avma)(di);
+         PtrdiffT text_bias = VG_(DebugInfo_get_text_bias)(di);
+         SizeT filename_len = VG_(strlen)(filename);
+
+         if (!VG_(HT_lookup)(debuginfo_table, (UWord) di))
+         {
+            DGDebugInfo *node = VG_(calloc)("debuginfo_table.node", 1, sizeof(DGDebugInfo));
+            node->header.key = (UWord) di;
+            VG_(umsg)("Filename = %s\ntext_avma = %#lx\ntext_bias = %ld\n",
+                      filename, text_avma, text_bias);
+            VG_(HT_add_node)(debuginfo_table, node);
+
+            if (filename_len > 128) filename_len = 128;
+            out_byte(DG_R_TEXT_AVMA);
+            out_byte(filename_len + sizeof(Addr) + 1);
+            out_word(text_avma);
+            out_bytes(filename, filename_len);
+            out_byte('\0');
+         }
+      }
+      debuginfo_dirty = False;
+   }
+}
+
 static IRSB* dg_instrument(VgCallbackClosure* closure,
                            IRSB* sbIn,
                            VexGuestLayout* layout,
@@ -252,6 +301,7 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
    }
 
    prepare_out_file();
+   clean_debuginfo();
 
    sbOut = deepCopyIRSBExceptStmts(sbIn);
 
@@ -394,6 +444,12 @@ static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
    return True;
 }
 
+static void dg_track_new_mem_mmap_or_startup(Addr a, SizeT len, Bool rr, Bool ww, Bool xx, ULong di_handle)
+{
+   if (xx)
+      debuginfo_dirty = True;
+}
+
 static void dg_fini(Int exitcode)
 {
    if (out_fd != -1)
@@ -401,6 +457,10 @@ static void dg_fini(Int exitcode)
       out_flush();
       VG_(close)(out_fd);
    }
+
+   /* TODO: need to free the node entries */
+   if (debuginfo_table != NULL)
+      VG_(HT_destruct)(debuginfo_table);
 }
 
 static void dg_pre_clo_init(void)
@@ -420,6 +480,8 @@ static void dg_pre_clo_init(void)
                                    dg_print_usage,
                                    dg_print_debug_usage);
    VG_(needs_client_requests)(dg_handle_client_request);
+   VG_(track_new_mem_startup)(dg_track_new_mem_mmap_or_startup);
+   VG_(track_new_mem_mmap)(dg_track_new_mem_mmap_or_startup);
 }
 
 VG_DETERMINE_INTERFACE_VERSION(dg_pre_clo_init)

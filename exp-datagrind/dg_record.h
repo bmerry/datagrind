@@ -34,5 +34,6 @@
 #define DG_R_START_EVENT      5
 #define DG_R_END_EVENT        6
 #define DG_R_INSTR            7
+#define DG_R_TEXT_AVMA        8
 
 #endif /* __DG_RECORD_H */
