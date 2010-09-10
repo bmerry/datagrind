@@ -36,11 +36,14 @@
 #include <set>
 #include <map>
 #include <string>
+#include <memory>
+#include <sstream>
 
 #include "dg_record.h"
 #include "dg_view.h"
 #include "dg_view_range.h"
 #include "dg_view_debuginfo.h"
+#include "dg_view_parse.h"
 
 using namespace std;
 
@@ -182,13 +185,10 @@ static vector<mem_access>::iterator nearest_access(double addr, double seq, doub
 
 static void load(const char *filename)
 {
-    uint8_t type;
-    uint8_t len;
-    uint8_t *body = NULL;
-    unsigned int body_size = 0;
     bool first = true;
     size_t seq = 0;
     HWord iaddr = 0;
+    record_parser *rp_ptr;
 
     FILE *f = fopen(filename, "r");
     if (!f)
@@ -196,53 +196,26 @@ static void load(const char *filename)
         fprintf(stderr, "Could not open `%s'.\n", filename);
         exit(1);
     }
-    while (fread(&type, 1, 1, f) == 1 && fread(&len, 1, 1, f) == 1)
+    while (NULL != (rp_ptr = record_parser::create(f)))
     {
-        /* No non-zero subtypes or short records so far */
-        if (type & 0x80)
-        {
-            fprintf(stderr, "Warning: unexpected header byte %#x\n", type);
-            continue;
-        }
-        else
-        {
-            if (len >= body_size)
-            {
-                delete[] body;
-                body = new uint8_t[len + 1];
-                body_size = len + 1;
-            }
-            if (fread(body, 1, len, f) != len)
-            {
-                fprintf(stderr, "Warning: short record at end of file\n");
-                break;
-            }
-            body[len] = '\0'; /* Guarantees termination of embedded strings */
+        auto_ptr<record_parser> rp(rp_ptr);
+        uint8_t type = rp->get_type();
 
+        try
+        {
             if (first)
             {
-                const char magic[] = "DATAGRIND1";
                 uint8_t version, endian, wordsize;
+
                 if (type != DG_R_HEADER)
-                {
-                    fprintf(stderr, "Error: did not find header\n");
-                    goto bad_file;
-                }
-                if (len < sizeof(magic) + 3)
-                {
-                    fprintf(stderr, "Error: header too short\n");
-                    goto bad_file;
-                }
-                if (0 != strncmp(magic, (const char *) body, sizeof(magic)))
-                {
-                    fprintf(stderr, "Error: header magic does not match\n");
-                    goto bad_file;
-                }
-                version = body[sizeof(magic)];
-                endian = body[sizeof(magic) + 1];
-                wordsize = body[sizeof(magic) + 2];
+                    throw record_parser_error("Error: did not find header");
+                if (rp->extract_string() != "DATAGRIND1")
+                    throw record_parser_error("Error: did not find signature");
+                version = rp->extract_byte();
+                endian = rp->extract_byte();
+                wordsize = rp->extract_byte();
                 int expected_version = 1;
-                if (version != 1)
+                if (version != expected_version)
                 {
                     fprintf(stderr, "Warning: version mismatch (expected %d, got %u).\n",
                             expected_version, version);
@@ -250,9 +223,9 @@ static void load(const char *filename)
                 /* TODO: do something useful with endianness */
                 if (wordsize != sizeof(HWord))
                 {
-                    fprintf(stderr, "Error: pointer size mismatch (expected %u, got %u)\n",
-                            (unsigned int) sizeof(HWord), wordsize);
-                    goto bad_file;
+                    ostringstream msg;
+                    msg << "Error: pointer size mismatch (expected " << sizeof(HWord) << ", got " << wordsize << ")";
+                    throw record_parser_content_error(msg.str());
                 }
 
                 first = false;
@@ -262,20 +235,13 @@ static void load(const char *filename)
                 switch (type)
                 {
                 case DG_R_HEADER:
-                    fprintf(stderr, "Warning: found header after first record.\n");
-                    goto bad_record;
+                    throw record_parser_content_error("Error: found header after first record.\n");
                 case DG_R_READ:
                 case DG_R_WRITE:
                 case DG_R_INSTR:
                     {
-                        if (len != 1 + sizeof(HWord))
-                        {
-                            fprintf(stderr, "Error: Wrong record length");
-                            goto bad_record;
-                        }
-                        uint8_t size = body[0];
-                        HWord addr;
-                        memcpy(&addr, body + 1, sizeof(addr));
+                        uint8_t size = rp->extract_byte();
+                        HWord addr = rp->extract_word();
                         if (type == DG_R_INSTR)
                         {
                             iaddr = addr;
@@ -328,34 +294,11 @@ static void load(const char *filename)
                     break;
                 case DG_R_TRACK_RANGE:
                     {
-                        HWord addr;
-                        HWord size;
-                        const uint8_t *ptr = body;
-                        if (len < 2 * sizeof(HWord) + 2)
-                        {
-                            fprintf(stderr, "Error: record too short (%d < %zu)\n",
-                                    len, 2 * sizeof(HWord) + 2);
-                            goto bad_record;
-                        }
-                        memcpy(&addr, ptr, sizeof(addr));
-                        ptr += sizeof(addr);
-                        memcpy(&size, ptr, sizeof(size));
-                        ptr += sizeof(size);
-                        string var_type = (const char *) ptr;
-                        ptr += var_type.size() + 1;
-                        if (ptr >= body + len)
-                        {
-                            fprintf(stderr, "Error: record missing field\n");
-                            goto bad_record;
-                        }
-                        string label = (const char *) ptr;
-                        ptr += label.size() + 1;
-                        if (ptr != body + len)
-                        {
-                            fprintf(stderr, "Error: record not properly terminated (%p vs %p)\n",
-                                    ptr, body + len);
-                            goto bad_record;
-                        }
+                        HWord addr = rp->extract_word();
+                        HWord size = rp->extract_word();
+
+                        string var_type = rp->extract_string();
+                        string label = rp->extract_string();
 
                         if (chosen_ranges.count(label))
                             active_ranges.insert(make_pair(addr, size));
@@ -363,15 +306,8 @@ static void load(const char *filename)
                     break;
                 case DG_R_UNTRACK_RANGE:
                     {
-                        HWord addr;
-                        HWord size;
-                        if (len != 2 * sizeof(HWord))
-                        {
-                            fprintf(stderr, "Error: record has wrong size\n");
-                            goto bad_record;
-                        }
-                        memcpy(&addr, body, sizeof(addr));
-                        memcpy(&size, body + sizeof(addr), sizeof(size));
+                        HWord addr = rp->extract_word();
+                        HWord size = rp->extract_word();
 
                         pair<HWord, HWord> key(addr, size);
                         multiset<pair<HWord, HWord> >::iterator it = active_ranges.find(key);
@@ -381,31 +317,18 @@ static void load(const char *filename)
                     break;
                 case DG_R_MALLOC_BLOCK:
                     {
-                       HWord addr;
-                       HWord size;
-                       HWord n_ips;
+                       HWord addr = rp->extract_word();
+                       HWord size = rp->extract_word();
+                       HWord n_ips = rp->extract_word();
                        vector<HWord> ips;
-                       if (len < 3 * sizeof(HWord))
-                       {
-                          fprintf(stderr, "Error: record is too short");
-                          goto bad_record;
-                       }
-                       memcpy(&addr, body, sizeof(addr));
-                       memcpy(&size, body + sizeof(addr), sizeof(size));
-                       memcpy(&n_ips, body + 2 * sizeof(addr), sizeof(n_ips));
-                       if (len != (n_ips + 3) * sizeof(HWord))
-                       {
-                          fprintf(stderr, "Error: record is wrong size");
-                          goto bad_record;
-                       }
 
                        mem_block *block = new mem_block;
                        block->addr = addr;
                        block->size = size;
+                       block->stack_trace.reserve(n_ips);
                        for (HWord i = 0; i < n_ips; i++)
                        {
-                          HWord stack_addr;
-                          memcpy(&stack_addr, body + (i + 3) * sizeof(HWord), sizeof(HWord));
+                          HWord stack_addr = rp->extract_word();
                           block->stack_trace.push_back(stack_addr);
                        }
                        block_storage.push_back(block);
@@ -414,26 +337,14 @@ static void load(const char *filename)
                     break;
                 case DG_R_FREE_BLOCK:
                     {
-                        HWord addr;
-
-                        if (len != sizeof(addr))
-                        {
-                            fprintf(stderr, "Error: record is wrong size");
-                            goto bad_record;
-                        }
-                        memcpy(&addr, body, sizeof(addr));
+                        HWord addr = rp->extract_word();
                         block_map.erase(addr);
                     }
                     break;
                 case DG_R_START_EVENT:
                 case DG_R_END_EVENT:
                     {
-                        string label = (char *) body;
-                        if (label.size() + 1 != len)
-                        {
-                            fprintf(stderr, "Error: record not properly terminated\n");
-                            goto bad_record;
-                        }
+                        string label = rp->extract_string();
                         if (chosen_events.count(label))
                         {
                             if (type == DG_R_START_EVENT)
@@ -449,34 +360,33 @@ static void load(const char *filename)
                     break;
                 case DG_R_TEXT_AVMA:
                     {
-                        HWord avma;
-
-                        if (len < sizeof(HWord) + 1)
-                        {
-                            fprintf(stderr, "Error: record has wrong size\n");
-                            goto bad_record;
-                        }
-                        memcpy(&avma, body, sizeof(avma));
-                        string filename((const char *) body + sizeof(avma));
-                        if (len != sizeof(avma) + filename.size() + 1)
-                        {
-                            fprintf(stderr, "Error: record not properly terminated\n");
-                            goto bad_record;
-                        }
-
+                        HWord avma = rp->extract_word();
+                        string filename = rp->extract_string();
                         load_object_file(filename.c_str(), avma);
                     }
                     break;
                 default:
-                    fprintf(stderr, "Warning: unknown record type %#x\n", type);
-                    goto bad_record;
+                    {
+                        ostringstream msg;
+                        msg << showbase << hex;
+                        msg << "Error: unknown record type " << (unsigned int) type;
+                        throw record_parser_content_error(msg.str());
+                    }
                 }
             }
+            rp->finish();
         }
-bad_record:;
+        catch (record_parser_content_error &e)
+        {
+            fprintf(stderr, "%s\n", e.what());
+            rp->discard();
+        }
+        catch (record_parser_error &e)
+        {
+            fprintf(stderr, "%s\n", e.what());
+            exit(1);
+        }
     }
-bad_file:
-    delete body;
     fclose(f);
 
     size_t remapped_base = 0;
