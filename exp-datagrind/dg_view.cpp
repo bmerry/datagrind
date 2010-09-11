@@ -298,7 +298,10 @@ static void load(const char *filename)
                             accesses[i].size = rp->extract_byte();
                             accesses[i].iseq = rp->extract_byte();
                         }
-                        // printf("Adding bbdef at %#lx\n", instr_addrs[0]);
+                        if (bbdef_map.count(instr_addrs[0]))
+                        {
+                            printf("Warning: duplicate bb at %#lx\n", instr_addrs[0]);
+                        }
                         bbdef &bbd = bbdef_map[instr_addrs[0]];
                         bbd.instr_addrs.swap(instr_addrs);
                         bbd.accesses.swap(accesses);
@@ -315,10 +318,14 @@ static void load(const char *filename)
                             stack[i] = rp->extract_word();
 
                         if (!bbdef_map.count(stack[0]))
-                            throw record_parser_content_error("Error: no bbdef found for address");
+                        {
+                            ostringstream msg;
+                            msg << "Error: no bbdef found for address ";
+                            msg << hex << showbase << stack[0];
+                            throw record_parser_content_error(msg.str());
+                        }
 
                         const bbdef &bbd = bbdef_map[stack[0]];
-                        // printf("Found bbrun at %#lx\n", stack[0]);
                         uint8_t n_instrs = rp->extract_byte();
                         uint64_t n_addrs = rp->remain() / sizeof(HWord);
                         if (n_addrs > bbd.accesses.size())
@@ -398,14 +405,12 @@ static void load(const char *filename)
                             block->stack_trace.push_back(stack_addr);
                         }
                         block_storage.push_back(block);
-                        printf("Alloc at %#lx size %#lx\n", addr, size);
                         block_map.insert(addr, addr + size, block);
                     }
                     break;
                 case DG_R_FREE_BLOCK:
                     {
                         HWord addr = rp->extract_word();
-                        printf("Free at %#lx\n", addr);
                         block_map.erase(addr);
                     }
                     break;
