@@ -47,13 +47,6 @@
 
 using namespace std;
 
-typedef enum
-{
-    ACCESS_TYPE_READ,
-    ACCESS_TYPE_WRITE,
-    ACCESS_TYPE_INSTR
-} access_type;
-
 struct mem_block
 {
     HWord addr;
@@ -64,33 +57,55 @@ struct mem_block
 
 struct mem_access
 {
-    HWord iaddr;
     HWord addr;
+    uint8_t dir;
     uint8_t size;
-    access_type type;
-    uint64_t seq;
+    HWord iaddr;
+    uint64_t iseq;
     mem_block *block;
 
     mem_access() {}
-    mem_access(HWord iaddr, HWord addr, uint8_t size, access_type type, uint64_t seq, mem_block *block)
-        : iaddr(iaddr), addr(addr), size(size), type(type), seq(seq), block(block) {}
+    mem_access(HWord addr, uint8_t dir, uint8_t size, HWord iaddr, uint64_t iseq, mem_block *block)
+        : addr(addr), dir(dir), size(size), iaddr(iaddr), iseq(iseq), block(block) {}
 };
 
-struct compare_mem_access_seq
+struct bbdef_access
+{
+    uint8_t dir;
+    uint8_t size;
+    uint8_t iseq;
+};
+
+struct bbdef
+{
+    vector<HWord> instr_addrs;
+    vector<bbdef_access> accesses;
+};
+
+struct bbrun
+{
+    bbdef *bb;
+    uint64_t iseq_start;
+    uint64_t dseq_start;
+    vector<HWord> stack_trace;
+    vector<HWord> addresses;
+};
+
+struct compare_mem_access_iseq
 {
     bool operator()(const mem_access &a, const mem_access &b) const
     {
-        return a.seq < b.seq;
+        return a.iseq < b.iseq;
     }
 
-    bool operator()(const mem_access &a, uint64_t seq) const
+    bool operator()(const mem_access &a, uint64_t iseq) const
     {
-        return a.seq < seq;
+        return a.iseq < iseq;
     }
 
-    bool operator()(uint64_t seq, const mem_access &a) const
+    bool operator()(uint64_t iseq, const mem_access &a) const
     {
-        return seq < a.seq;
+        return iseq < a.iseq;
     }
 };
 
@@ -110,6 +125,7 @@ static set<string> chosen_events;
 /* Ranges selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_ranges;
 
+static map<HWord, bbdef> bbdef_map;
 static vector<mem_access> accesses;
 static map<HWord, size_t> page_map;
 static map<size_t, HWord> rev_page_map;
@@ -121,18 +137,7 @@ template<typename T> T page_round_down(T x)
     return x & ~(DG_VIEW_PAGE_SIZE - 1);
 }
 
-static HWord seq_to_iaddr(uint64_t seq)
-{
-    compare_mem_access_seq cmp;
-    vector<mem_access>::const_iterator pos = upper_bound(accesses.begin(), accesses.end(), seq, cmp);
-
-    if (pos == accesses.begin())
-        return 0;
-    --pos;
-    return pos->iaddr;
-}
-
-static vector<mem_access>::iterator nearest_access(double addr, double seq, double addr_scale, double seq_scale)
+static vector<mem_access>::iterator nearest_access(double addr, double iseq, double addr_scale, double iseq_scale)
 {
     /* Start at the right instruction and search outwards until we can bound
      * the search.
@@ -140,20 +145,20 @@ static vector<mem_access>::iterator nearest_access(double addr, double seq, doub
     vector<mem_access>::iterator back, forw, best;
     double best_score = HUGE_VAL;
 
-    forw = lower_bound(accesses.begin(), accesses.end(), (uint64_t) seq, compare_mem_access_seq());
+    forw = lower_bound(accesses.begin(), accesses.end(), (uint64_t) iseq, compare_mem_access_iseq());
     back = forw;
     best = forw;
     while (forw != accesses.end() || back != accesses.begin())
     {
         if (forw != accesses.end())
         {
-            double seq_score = (forw->seq - seq) * seq_scale;
-            if (seq_score > best_score)
+            double iseq_score = (forw->iseq - iseq) * iseq_scale;
+            if (iseq_score > best_score)
                 forw = accesses.end();
             else
             {
                 double addr_score = (forw->addr - addr) * addr_scale;
-                double score = hypot(addr_score, seq_score);
+                double score = hypot(addr_score, iseq_score);
                 if (score < best_score)
                 {
                     best_score = score;
@@ -165,13 +170,13 @@ static vector<mem_access>::iterator nearest_access(double addr, double seq, doub
         if (back != accesses.begin())
         {
             --back;
-            double seq_score = (seq - back->seq) * seq_scale;
-            if (seq_scale > best_score)
+            double iseq_score = (iseq - back->iseq) * iseq_scale;
+            if (iseq_scale > best_score)
                 back = accesses.begin();
             else
             {
                 double addr_score = (back->addr - addr) * addr_scale;
-                double score = hypot(addr_score, seq_score);
+                double score = hypot(addr_score, iseq_score);
                 if (score < best_score)
                 {
                     best_score = score;
@@ -183,10 +188,42 @@ static vector<mem_access>::iterator nearest_access(double addr, double seq, doub
     return best;
 }
 
+static void add_access(HWord addr, uint8_t dir, uint8_t size, HWord iaddr, uint64_t iseq)
+{
+    bool matched;
+    if (!chosen_events.empty() && active_events.empty())
+        matched = false;
+    else if (!chosen_ranges.empty())
+    {
+        matched = false;
+        for (multiset<pair<HWord, HWord> >::const_iterator i = active_ranges.begin(); i != active_ranges.end(); ++i)
+        {
+            if (addr + size > i->first && addr < i->first + i->second)
+            {
+                matched = true;
+                break;
+            }
+        }
+    }
+    else
+        matched = true;
+
+    if (matched)
+    {
+        mem_block *block = NULL;
+        rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
+        if (block_it != block_map.end())
+            block = block_it->second;
+        accesses.push_back(mem_access(addr, dir, size, iaddr, iseq, block));
+        page_map[page_round_down(addr)] = 0;
+    }
+}
+
 static void load(const char *filename)
 {
     bool first = true;
-    size_t seq = 0;
+    uint64_t iseq = 0;
+    uint64_t dseq = 0;
     HWord iaddr = 0;
     record_parser *rp_ptr;
 
@@ -236,60 +273,89 @@ static void load(const char *filename)
                 {
                 case DG_R_HEADER:
                     throw record_parser_content_error("Error: found header after first record.\n");
-                case DG_R_READ:
-                case DG_R_WRITE:
+
+                case DG_R_BBDEF:
+                    {
+                        uint8_t n_instrs = rp->extract_byte();
+                        HWord n_accesses = rp->extract_word();
+
+                        if (n_instrs == 0)
+                        {
+                            throw record_parser_content_error("Error: empty BB");
+                        }
+                        vector<HWord> instr_addrs(n_instrs);
+                        vector<bbdef_access> accesses(n_accesses);
+
+                        for (HWord i = 0; i < n_instrs; i++)
+                        {
+                            instr_addrs[i] = rp->extract_word();
+                            // discard size
+                            (void) rp->extract_byte();
+                        }
+                        for (HWord i = 0; i < n_accesses; i++)
+                        {
+                            accesses[i].dir = rp->extract_byte();
+                            accesses[i].size = rp->extract_byte();
+                            accesses[i].iseq = rp->extract_byte();
+                        }
+                        // printf("Adding bbdef at %#lx\n", instr_addrs[0]);
+                        bbdef &bbd = bbdef_map[instr_addrs[0]];
+                        bbd.instr_addrs.swap(instr_addrs);
+                        bbd.accesses.swap(accesses);
+                    }
+                    break;
+                case DG_R_BBRUN:
+                    {
+                        bbrun bbr;
+                        uint8_t n_stack = rp->extract_byte();
+                        if (n_stack == 0)
+                            throw record_parser_content_error("Error: empty call stack");
+                        vector<HWord> stack(n_stack);
+                        for (uint8_t i = 0; i < n_stack; i++)
+                            stack[i] = rp->extract_word();
+
+                        if (!bbdef_map.count(stack[0]))
+                            throw record_parser_content_error("Error: no bbdef found for address");
+
+                        const bbdef &bbd = bbdef_map[stack[0]];
+                        // printf("Found bbrun at %#lx\n", stack[0]);
+                        uint8_t n_instrs = rp->extract_byte();
+                        uint64_t n_addrs = rp->remain() / sizeof(HWord);
+                        if (n_addrs > bbd.accesses.size())
+                            throw record_parser_content_error("Error: too many access addresses");
+
+                        for (HWord i = 0; i < n_addrs; i++)
+                        {
+                            HWord addr = rp->extract_word();
+                            const bbdef_access &access = bbd.accesses[i];
+                            add_access(addr, access.dir, access.size, bbd.instr_addrs[access.iseq], iseq + access.iseq);
+                        }
+
+                        iseq += n_instrs;
+                        dseq += n_addrs;
+                    }
+                    break;
                 case DG_R_INSTR:
+                    {
+                        /* size = */ rp->extract_byte();
+                        iaddr = rp->extract_word();
+                        iseq++;
+                    }
+                    break;
+                case DG_R_READ:
                     {
                         uint8_t size = rp->extract_byte();
                         HWord addr = rp->extract_word();
-                        if (type == DG_R_INSTR)
-                        {
-                            iaddr = addr;
-                            seq++;
-                            break;
-                        }
-
-                        bool matched;
-                        if (!chosen_events.empty() && active_events.empty())
-                            matched = false;
-                        else if (!chosen_ranges.empty())
-                        {
-                            matched = false;
-                            for (multiset<pair<HWord, HWord> >::const_iterator i = active_ranges.begin(); i != active_ranges.end(); ++i)
-                            {
-                                if (addr + size > i->first && addr < i->first + i->second)
-                                {
-                                    matched = true;
-                                    break;
-                                }
-                            }
-                        }
-                        else
-                            matched = true;
-                        if (matched)
-                        {
-                            access_type atype;
-                            switch (type)
-                            {
-                            case DG_R_READ:
-                                atype = ACCESS_TYPE_READ;
-                                break;
-                            case DG_R_WRITE:
-                                atype = ACCESS_TYPE_WRITE;
-                                break;
-                            case DG_R_INSTR:
-                                atype = ACCESS_TYPE_INSTR;
-                                break;
-                            }
-
-                            mem_block *block = NULL;
-                            rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
-                            if (block_it != block_map.end())
-                                block = block_it->second;
-                            accesses.push_back(mem_access(iaddr, addr, size, atype, seq, block));
-                            page_map[page_round_down(addr)] = 0;
-                        }
-                        seq++;
+                        add_access(addr, DG_ACC_READ, size, iaddr, iseq);
+                        dseq++;
+                    }
+                    break;
+                case DG_R_WRITE:
+                    {
+                        uint8_t size = rp->extract_byte();
+                        HWord addr = rp->extract_word();
+                        add_access(addr, DG_ACC_WRITE, size, iaddr, iseq);
+                        dseq++;
                     }
                     break;
                 case DG_R_TRACK_RANGE:
@@ -317,27 +383,29 @@ static void load(const char *filename)
                     break;
                 case DG_R_MALLOC_BLOCK:
                     {
-                       HWord addr = rp->extract_word();
-                       HWord size = rp->extract_word();
-                       HWord n_ips = rp->extract_word();
-                       vector<HWord> ips;
+                        HWord addr = rp->extract_word();
+                        HWord size = rp->extract_word();
+                        HWord n_ips = rp->extract_word();
+                        vector<HWord> ips;
 
-                       mem_block *block = new mem_block;
-                       block->addr = addr;
-                       block->size = size;
-                       block->stack_trace.reserve(n_ips);
-                       for (HWord i = 0; i < n_ips; i++)
-                       {
-                          HWord stack_addr = rp->extract_word();
-                          block->stack_trace.push_back(stack_addr);
-                       }
-                       block_storage.push_back(block);
-                       block_map.insert(addr, addr + size, block);
+                        mem_block *block = new mem_block;
+                        block->addr = addr;
+                        block->size = size;
+                        block->stack_trace.reserve(n_ips);
+                        for (HWord i = 0; i < n_ips; i++)
+                        {
+                            HWord stack_addr = rp->extract_word();
+                            block->stack_trace.push_back(stack_addr);
+                        }
+                        block_storage.push_back(block);
+                        printf("Alloc at %#lx size %#lx\n", addr, size);
+                        block_map.insert(addr, addr + size, block);
                     }
                     break;
                 case DG_R_FREE_BLOCK:
                     {
                         HWord addr = rp->extract_word();
+                        printf("Free at %#lx\n", addr);
                         block_map.erase(addr);
                     }
                     break;
@@ -449,18 +517,18 @@ static void init_gl(void)
         for (int j = 0; j < accesses[i].size; j++)
         {
             vertices[v].pos[0] = remap_address(accesses[i].addr) + j;
-            vertices[v].pos[1] = accesses[i].seq;
+            vertices[v].pos[1] = accesses[i].iseq;
             min_x = min(min_x, vertices[v].pos[0]);
             max_x = max(max_x, vertices[v].pos[0]);
-            switch (accesses[i].type)
+            switch (accesses[i].dir)
             {
-            case ACCESS_TYPE_READ:
+            case DG_ACC_READ:
                 memcpy(vertices[v].color, color_read, sizeof(color_read));
                 break;
-            case ACCESS_TYPE_WRITE:
+            case DG_ACC_WRITE:
                 memcpy(vertices[v].color, color_write, sizeof(color_write));
                 break;
-            case ACCESS_TYPE_INSTR:
+            case DG_ACC_EXEC:
                 memcpy(vertices[v].color, color_instr, sizeof(color_instr));
                 break;
             }
