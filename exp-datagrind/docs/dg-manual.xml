@@ -249,6 +249,60 @@ struct event
 </screen>
 </sect2>
 
+<sect2 id="dg-manual.record-bb" xreflabel="Basic blocks">
+<title>Basic block events</title>
+</sect2>
+<para>Basic blocks are first defined, then later run. A basic block is
+actually a superblock, so may cover discontiguous addresses and have internal
+exits. The block definition describes the read and write accesses in the
+block, as instruction counts relative to the start of the block. The
+bbdef_entry fields correspond to IMark and data access tags in the VEX IR i.e.
+it will always start with an instruction entry.
+</para>
+<para>When a block is run, it will refer to a previous block definition by
+the start address. It then contains the addresses of the data accesses, in the
+same order as the data-access entries in the definition. Because a basic block
+can be exited early, there is an instruction count in the record, and only
+the data accesses for this many instructions will be reported.
+</para>
+<para>Basic block definitions are limited to 255 instructions and should not
+cross function boundaries, so they may be smaller than VEX basic blocks.</para>
+<screen><![CDATA[
+struct bbdef_instr
+{
+    HWord addr;
+    byte size;
+};
+
+struct bbdef_access
+{
+    byte dir;            // DG_ACC_READ or DG_ACC_WRITE
+    byte size;           // size of data access
+    byte iseq;           // index into the instruction array
+};
+
+struct bbdef
+{
+    byte record_type;    // DG_R_BBDEF
+    byte record_length;
+    byte n_instrs;       // number of instructions
+    HWord n_accesses;    // number of data accesses
+    bbdef_instr instrs[n_instr];
+    bbdef_access accesses[n_accesses];
+};
+
+struct bbrun
+{
+    byte record_type;    // DG_R_BBRUN
+    byte record_length;
+    byte n_stack;
+    HWord stack[n_stack];// call stack at start of block
+    byte n_instrs;       // number of instructions executed before leaving
+    HWord addrs[];       // length determined from record size
+};]]>
+</screen>
+</sect2>
+
 </sect1>
 
 </chapter>

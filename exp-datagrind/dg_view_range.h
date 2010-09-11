@@ -138,8 +138,14 @@ typename rangemap<Address, Data>::iterator rangemap<Address, Data>::insert(const
     if (high != ranges.begin())
     {
         const_iterator low = high;
+        --low;
         if (low->first.second > value.first.first)
+        {
+            printf("(%#lx,%#lx) overlaps (%#lx,%#lx)\n",
+                   low->first.first, low->first.second,
+                   value.first.first, value.first.second);
             throw std::invalid_argument("Overlapping ranges");
+        }
     }
 
     return ranges.insert(value);

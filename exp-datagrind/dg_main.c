@@ -32,6 +32,7 @@
 #include "pub_tool_tooliface.h"
 #include "pub_tool_vki.h"
 #include "pub_tool_hashtable.h"
+#include "pub_tool_xarray.h"
 #include "pub_tool_mallocfree.h"
 #include "pub_tool_libcassert.h"
 #include "pub_tool_libcprint.h"
@@ -42,9 +43,14 @@
 #include "pub_tool_replacemalloc.h"
 #include "pub_tool_options.h"
 #include "pub_tool_machine.h"
+#include "pub_tool_threadstate.h"
 
 #include "datagrind.h"
 #include "dg_record.h"
+
+#define STACK_DEPTH 4
+#define NEVENTS 4
+#define OUT_BUF_SIZE 4096
 
 typedef enum
 {
@@ -74,28 +80,48 @@ typedef struct
    StackTrace ips;
 } DgMallocBlock;
 
-#define STACK_DEPTH 4
-#define NEVENTS 4
-#define OUT_BUF_SIZE 4096
+typedef struct
+{
+   HWord addr;
+   UChar size;
+} DgBBDefInstr;
 
-static Event events[NEVENTS];
-static Int nevents = 0;
+typedef struct
+{
+   UChar dir;
+   UChar size;
+   UChar iseq;
+} DgBBDefAccess;
+
+typedef struct
+{
+   XArray *instrs;
+   XArray *accesses;
+} DgBBDef;
+
+typedef struct
+{
+   UInt n_ips;
+   Addr ips[STACK_DEPTH];
+   HWord n_instrs;
+   XArray *accesses; /* HWord */
+} DgBBRun;
+
 static Int out_fd = -1;
-static Char out_buf[OUT_BUF_SIZE];
+static UChar out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
+static DgBBRun out_bbr;
 
 static VgHashTable debuginfo_table = NULL;
 static Bool debuginfo_dirty = True;
 
 static VgHashTable block_table = NULL;
 
-static Bool clo_datagrind_trace_instr = True;
 static Char *clo_datagrind_out_file = "datagrind.out.%p";
 
 static Bool dg_process_cmd_line_option(Char *arg)
 {
    if (VG_STR_CLO(arg, "--datagrind-out-file", clo_datagrind_out_file)) {}
-   else if (VG_BOOL_CLO(arg, "--datagrind-track-instr", clo_datagrind_trace_instr)) {}
    else if (VG_(replacement_malloc_process_cmd_line_option)(arg)) {}
    else
        return False;
@@ -106,7 +132,6 @@ static void dg_print_usage(void)
 {
    VG_(printf)(
 "    --datagrind-out-file=<file>      output file name [datagrind.out]\n"
-"    --datagrind-trace-instr=yes|no   trace instructions [yes]\n"
    );
 }
 
@@ -117,19 +142,13 @@ static void dg_print_debug_usage(void)
    );
 }
 
-static void dg_post_clo_init(void)
-{
-   debuginfo_table = VG_(HT_construct)("datagrind.debuginfo_table");
-   block_table = VG_(HT_construct)("datagrind.block_table");
-}
-
 static void out_flush(void)
 {
    VG_(write)(out_fd, out_buf, out_buf_used);
    out_buf_used = 0;
 }
 
-static void out_bytes(const void *buf, Int count)
+static void out_bytes(const void *buf, UInt count)
 {
    if (count > OUT_BUF_SIZE - out_buf_used)
       out_flush();
@@ -137,7 +156,7 @@ static void out_bytes(const void *buf, Int count)
    out_buf_used += count;
 }
 
-static void out_byte(Char byte)
+static void out_byte(UChar byte)
 {
    if (out_buf_used >= OUT_BUF_SIZE)
       out_flush();
@@ -149,119 +168,102 @@ static inline void out_word(UWord word)
    out_bytes(&word, sizeof(word));
 }
 
-static inline void trace_access(Addr addr, SizeT size, Char rtype)
+static void out_length(ULong len)
 {
-   out_byte(rtype);
-   out_byte(1 + sizeof(addr));
-   out_byte(size);
-   out_word(addr);
-}
-
-static VG_REGPARM(2) void trace_Dr(Addr addr, SizeT size)
-{
-   trace_access(addr, size, DG_R_READ);
-}
-
-static VG_REGPARM(2) void trace_Dw(Addr addr, SizeT size)
-{
-   trace_access(addr, size, DG_R_WRITE);
-}
-
-static VG_REGPARM(2) void trace_Ir(Addr addr, SizeT size)
-{
-   trace_access(addr, size, DG_R_INSTR);
-}
-
-static void flushEvents(IRSB *sb)
-{
-   Int i;
-   static const struct
+   if (len < 255)
+      out_byte((UChar) len);
+   else
    {
-      const Char *name;
-      void *fn;
-   } helpers[3] =
-   {
-      { "trace_Dr", &trace_Dr },
-      { "trace_Dw", &trace_Dw },
-      { "trace_Ir", &trace_Ir }
-   };
-
-   for (i = 0; i < nevents; i++)
-   {
-      Event *ev = &events[i];
-      IRExpr **argv;
-      IRDirty *di;
-
-      argv = mkIRExprVec_2(ev->addr, mkIRExpr_HWord(ev->size));
-      di = unsafeIRDirty_0_N(2, (Char *) helpers[ev->type].name,
-                             VG_(fnptr_to_fnentry)(helpers[ev->type].fn),
-                             argv);
-      addStmtToIRSB(sb, IRStmt_Dirty(di));
+      out_byte(255);
+      out_bytes(&len, sizeof(len));
    }
-   nevents = 0;
-}
-
-static void addEvent(IRSB *sb, IRExpr *addr, Int size, EventType type)
-{
-   Event *ev;
-   if (nevents == NEVENTS)
-      flushEvents(sb);
-   ev = &events[nevents];
-   ev->type = type;
-   ev->addr = addr;
-   ev->size = size;
-   nevents++;
-}
-
-static void addEvent_Dr(IRSB *sb, IRExpr *daddr, Int dsize)
-{
-   addEvent(sb, daddr, dsize, EventType_Dr);
-}
-
-static void addEvent_Dw(IRSB *sb, IRExpr *daddr, Int dsize)
-{
-   addEvent(sb, daddr, dsize, EventType_Dw);
-}
-
-static void addEvent_Ir(IRSB *sb, IRExpr *iaddr, Int isize)
-{
-   addEvent(sb, iaddr, isize, EventType_Ir);
 }
 
 static void prepare_out_file(void)
 {
-   if (out_fd == -1)
+   SysRes sres;
+   Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
+   sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
+                    VKI_S_IRUSR | VKI_S_IWUSR);
+   if (sr_isError(sres))
    {
-      SysRes sres;
-      Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
-      sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
-                       VKI_S_IRUSR | VKI_S_IWUSR);
-      if (sr_isError(sres))
-      {
-         VG_(message)(Vg_UserMsg,
-                      "Error: can not open datagrind output file `%s'\n",
-                      filename);
-         VG_(exit)(1);
-      }
-      else
-      {
-         static const Char magic[] = "DATAGRIND1";
-
-         out_fd = (Int) sr_Res(sres);
-         out_byte(DG_R_HEADER);
-         out_byte(sizeof(magic) + 3);
-         out_bytes(magic, sizeof(magic));
-         out_byte(1); /* version */
-#if VG_BIGENDIAN
-         out_byte(1);
-#elif VG_LITTLEENDIAN
-         out_byte(0);
-#else
-         tl_assert(0);
-#endif
-         out_byte(VG_WORDSIZE);
-      }
+      VG_(message)(Vg_UserMsg,
+                   "Error: can not open datagrind output file `%s'\n",
+                   filename);
+      VG_(exit)(1);
    }
+   else
+   {
+      static const Char magic[] = "DATAGRIND1";
+
+      out_fd = (Int) sr_Res(sres);
+      out_byte(DG_R_HEADER);
+      out_byte(sizeof(magic) + 3);
+      out_bytes(magic, sizeof(magic));
+      out_byte(1); /* version */
+#if VG_BIGENDIAN
+      out_byte(1);
+#elif VG_LITTLEENDIAN
+      out_byte(0);
+#else
+      tl_assert(0);
+#endif
+      out_byte(VG_WORDSIZE);
+   }
+}
+
+static void dg_post_clo_init(void)
+{
+   debuginfo_table = VG_(HT_construct)("datagrind.debuginfo_table");
+   block_table = VG_(HT_construct)("datagrind.block_table");
+   out_bbr.n_instrs = 0;
+   out_bbr.n_ips = 0;
+   out_bbr.accesses = VG_(newXA)(VG_(malloc), "datagrind.out_bb.accesses",
+                                 VG_(free), sizeof(HWord));
+
+   prepare_out_file();
+}
+
+static void trace_bb_flush(DgBBRun *bbr)
+{
+   if (bbr->n_instrs > 0)
+   {
+      UInt i;
+      Word n_accesses = VG_(sizeXA)(bbr->accesses);
+      ULong length = 2 + (bbr->n_ips + n_accesses) * sizeof(HWord);
+
+      out_byte(DG_R_BBRUN);
+      out_length(length);
+      out_byte(bbr->n_ips);
+      for (i = 0; i < bbr->n_ips; i++)
+         out_word(bbr->ips[i]);
+      out_byte(bbr->n_instrs);
+      for (i = 0; i < n_accesses; i++)
+         out_word(*(HWord *) VG_(indexXA)(bbr->accesses, i));
+
+      /* Reset for next */
+      bbr->n_instrs = 0;
+      bbr->n_ips = 0;
+      VG_(dropTailXA)(bbr->accesses, n_accesses);
+   }
+}
+
+static VG_REGPARM(1) void trace_bb_start(Addr iaddr)
+{
+   DgBBRun *bbr = &out_bbr;
+
+   trace_bb_flush(bbr);
+   bbr->n_ips = VG_(get_StackTrace)(VG_(get_running_tid)(), bbr->ips, STACK_DEPTH, NULL, NULL, 0);
+}
+
+static VG_REGPARM(1) void trace_access(Addr addr)
+{
+   VG_(addToXA)(out_bbr.accesses, &addr);
+}
+
+static VG_REGPARM(1) void trace_update_instrs(HWord n_instrs)
+{
+   out_bbr.n_instrs = n_instrs;
 }
 
 static void clean_debuginfo(void)
@@ -294,6 +296,118 @@ static void clean_debuginfo(void)
    }
 }
 
+static void dg_bbdef_init(DgBBDef *bbd)
+{
+   bbd->instrs = VG_(newXA)(VG_(malloc), "datagrind.instrs", VG_(free), sizeof(DgBBDefInstr));
+   bbd->accesses = VG_(newXA)(VG_(malloc), "datagrind.accesses", VG_(free), sizeof(DgBBDefAccess));
+}
+
+static void dg_bbdef_flush(DgBBDef *bbd)
+{
+   Word n_instrs = VG_(sizeXA)(bbd->instrs);
+   Word n_accesses = VG_(sizeXA)(bbd->accesses);
+   ULong len = 1 + sizeof(HWord) + (1 + sizeof(HWord)) * n_instrs + 3 * n_accesses;
+   Word i;
+
+   if (n_instrs == 0)
+      return;
+   tl_assert(n_instrs <= 255);
+
+   out_byte(DG_R_BBDEF);
+   out_length(len);
+   out_byte(n_instrs);
+   out_word(n_accesses);
+   for (i = 0; i < n_instrs; i++)
+   {
+      DgBBDefInstr *instr = (DgBBDefInstr *) VG_(indexXA)(bbd->instrs, i);
+      out_word(instr->addr);
+      out_byte(instr->size);
+   }
+   for (i = 0; i < n_accesses; i++)
+   {
+      DgBBDefAccess *access = (DgBBDefAccess *) VG_(indexXA)(bbd->accesses, i);
+      out_byte(access->dir);
+      out_byte(access->size);
+      out_byte(access->iseq);
+   }
+
+   /* Empty the arrays */
+   VG_(dropTailXA)(bbd->instrs, n_instrs);
+   VG_(dropTailXA)(bbd->accesses, n_accesses);
+}
+
+static void dg_bbdef_destroy(DgBBDef *bbd)
+{
+   VG_(deleteXA)(bbd->instrs);
+   VG_(deleteXA)(bbd->accesses);
+}
+
+static void dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size)
+{
+   DgBBDefInstr instr;
+
+   if (VG_(sizeXA)(bbd->instrs) == 255)
+      dg_bbdef_flush(bbd);
+
+   if (VG_(sizeXA)(bbd->instrs) == 0)
+   {
+      /* Start of internal BB, so inject code to grab stack trace */
+      IRDirty* di;
+      IRExpr** argv;
+
+      argv = mkIRExprVec_1(mkIRExpr_HWord(addr));
+      /* TODO: does this need to marked as reading guest state and memory, for
+       * stack unwinding?
+       */
+      di = unsafeIRDirty_0_N(1, (Char *) "trace_bb_start",
+                             VG_(fnptr_to_fnentry)(&trace_bb_start), argv);
+      addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+   }
+
+   tl_assert(size <= 255);
+   instr.addr = addr;
+   instr.size = (UChar) size;
+   VG_(addToXA)(bbd->instrs, &instr);
+}
+
+static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *addr, SizeT size)
+{
+   SizeT n_instrs = VG_(sizeXA)(bbd->instrs);
+   DgBBDefAccess access;
+   IRDirty* di;
+   IRExpr** argv;
+
+   tl_assert(n_instrs > 0);
+   tl_assert(size <= 255);
+   access.dir = dir;
+   access.size = size;
+   access.iseq = n_instrs - 1;
+   VG_(addToXA)(bbd->accesses, &access);
+
+   argv = mkIRExprVec_1(addr);
+   di = unsafeIRDirty_0_N(1, (Char *) "trace_access",
+                          VG_(fnptr_to_fnentry)(&trace_access), argv);
+   addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+}
+
+/* Adds IR to update the instruction count. Must be done before an exit
+ * from a block.
+ */
+static void dg_bbdef_update_instrs(IRSB *sbOut, DgBBDef *bbd)
+{
+   IRDirty* di;
+   IRExpr** argv;
+   SizeT n_instrs = VG_(sizeXA)(bbd->instrs);
+
+   if (n_instrs == 0)
+      return;
+
+   argv = mkIRExprVec_1(mkIRExpr_HWord(n_instrs));
+   di = unsafeIRDirty_0_N(1, (Char *) "trace_update_instrs",
+                          VG_(fnptr_to_fnentry)(&trace_update_instrs), argv);
+   addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+}
+
 static IRSB* dg_instrument(VgCallbackClosure* closure,
                            IRSB* sbIn,
                            VexGuestLayout* layout,
@@ -302,6 +416,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
 {
    IRSB* sbOut;
    Int i;
+   DgBBDef bbd;
+   Bool needs_flush = False;
 
    if (gWordTy != hWordTy)
    {
@@ -309,7 +425,6 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
       VG_(tool_panic)("host/guest word size mismatch");
    }
 
-   prepare_out_file();
    clean_debuginfo();
 
    sbOut = deepCopyIRSBExceptStmts(sbIn);
@@ -319,6 +434,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
    {
       addStmtToIRSB(sbOut, sbIn->stmts[i]);
    }
+
+   dg_bbdef_init(&bbd);
 
    for (; i < sbIn->stmts_used; i++)
    {
@@ -332,32 +449,43 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_Put:
          case Ist_PutI:
          case Ist_MBE:
+            addStmtToIRSB(sbOut, st);
             break;
          case Ist_Exit:
-            flushEvents(sbOut);
+            dg_bbdef_update_instrs(sbOut, &bbd);
+            /* TODO: only needed when crossing function boundaries */
+            needs_flush = True;
+            addStmtToIRSB(sbOut, st);
             break;
          case Ist_IMark:
-            if (clo_datagrind_trace_instr)
+            if (needs_flush)
             {
-                addEvent_Ir(sbOut, mkIRExpr_HWord((HWord) st->Ist.IMark.addr),
-                            st->Ist.IMark.len);
+               dg_bbdef_flush(&bbd);
+               needs_flush = False;
             }
+            addStmtToIRSB(sbOut, st);
+            dg_bbdef_add_instr(sbOut, &bbd, st->Ist.IMark.addr, st->Ist.IMark.len);
             break;
          case Ist_WrTmp:
             {
                IRExpr* data = st->Ist.WrTmp.data;
                if (data->tag == Iex_Load)
                {
-                  addEvent_Dr(sbOut, data->Iex.Load.addr, sizeofIRType(data->Iex.Load.ty));
+                  dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ,
+                                       data->Iex.Load.addr,
+                                       sizeofIRType(data->Iex.Load.ty));
                }
             }
+            addStmtToIRSB(sbOut, st);
             break;
          case Ist_Store:
             {
                IRExpr* data = st->Ist.Store.data;
-               addEvent_Dw(sbOut, st->Ist.Store.addr,
-                           sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)));
+               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE,
+                                    st->Ist.Store.addr,
+                                    sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)));
             }
+            addStmtToIRSB(sbOut, st);
             break;
          case Ist_Dirty:
             {
@@ -367,11 +495,14 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                   tl_assert(d->mAddr != NULL);
                   tl_assert(d->mSize != 0);
                   if (d->mFx == Ifx_Read || d->mFx == Ifx_Modify)
-                     addEvent_Dr(sbOut, d->mAddr, d->mSize);
+                     dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ,
+                                          d->mAddr, d->mSize);
                   if (d->mFx == Ifx_Write || d->mFx == Ifx_Modify)
-                     addEvent_Dw(sbOut, d->mAddr, d->mSize);
+                     dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE,
+                                          d->mAddr, d->mSize);
                }
             }
+            addStmtToIRSB(sbOut, st);
             break;
          case Ist_CAS:
             {
@@ -382,22 +513,24 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                dataSize = sizeofIRType(typeOfIRExpr(sbOut->tyenv, cas->dataLo));
                if (cas->dataHi != NULL)
                   dataSize *= 2;
-               addEvent_Dr(sbOut, cas->addr, dataSize);
-               addEvent_Dw(sbOut, cas->addr, dataSize);
+               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ, cas->addr, dataSize);
+               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE, cas->addr, dataSize);
             }
+            addStmtToIRSB(sbOut, st);
             break;
          default:
             tl_assert(0);
       }
-      addStmtToIRSB(sbOut, st);
    }
 
-   flushEvents(sbOut);
+   dg_bbdef_update_instrs(sbOut, &bbd);
+   dg_bbdef_flush(&bbd);
+   dg_bbdef_destroy(&bbd);
 
    return sbOut;
 }
 
-static void log_add_block(DgMallocBlock* block)
+static void out_add_block(DgMallocBlock* block)
 {
    UInt i;
    out_byte(DG_R_MALLOC_BLOCK);
@@ -410,7 +543,7 @@ static void log_add_block(DgMallocBlock* block)
       out_word(block->ips[i]);
 }
 
-static void log_remove_block(DgMallocBlock* block)
+static void out_remove_block(DgMallocBlock* block)
 {
    out_byte(DG_R_FREE_BLOCK);
    out_byte(sizeof(Addr));
@@ -434,7 +567,7 @@ static void add_block(ThreadId tid, void* p, SizeT szB, Bool custom)
 
    VG_(HT_add_node)(block_table, block);
 
-   log_add_block(block);
+   out_add_block(block);
 }
 
 /* Returns true if the block was found */
@@ -444,7 +577,7 @@ static Bool remove_block(void* p)
    if (block == NULL)
       return False;
 
-   log_remove_block(block);
+   out_remove_block(block);
 
    VG_(free)(block->ips);
    VG_(free)(block);
@@ -501,10 +634,10 @@ static void* dg_realloc(ThreadId tid, void* p, SizeT szB)
    if (szB <= block->actual_szB)
    {
       /* No need to resize. */
-      log_remove_block(block);
+      out_remove_block(block);
       block->szB = szB;
       block->n_ips = VG_(get_StackTrace)(tid, block->ips, STACK_DEPTH, NULL, NULL, 0);
-      log_add_block(block);
+      out_add_block(block);
       return p;
    }
    else
@@ -515,7 +648,7 @@ static void* dg_realloc(ThreadId tid, void* p, SizeT szB)
          return NULL;
       VG_(memcpy)(new_p, p, block->szB);
 
-      log_remove_block(block);
+      out_remove_block(block);
       VG_(HT_remove)(block_table, (UWord) p);
 
       block->header.key = (UWord) new_p;
@@ -524,7 +657,7 @@ static void* dg_realloc(ThreadId tid, void* p, SizeT szB)
       block->n_ips = VG_(get_StackTrace)(tid, block->ips, STACK_DEPTH, NULL, NULL, 0);
 
       VG_(HT_add_node)(block_table, block);
-      log_add_block(block);
+      out_add_block(block);
       return new_p;
    }
 }
@@ -614,6 +747,9 @@ static void dg_track_new_mem_mmap_or_startup(Addr a, SizeT len, Bool rr, Bool ww
 
 static void dg_fini(Int exitcode)
 {
+   trace_bb_flush(&out_bbr);
+   VG_(deleteXA)(out_bbr.accesses);
+
    if (out_fd != -1)
    {
       out_flush();

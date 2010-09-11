@@ -125,6 +125,11 @@ std::string record_parser::extract_string()
     throw record_parser_string_error();
 }
 
+uint64_t record_parser::remain() const
+{
+   return size - offset;
+}
+
 void record_parser::finish()
 {
     if (offset != size)

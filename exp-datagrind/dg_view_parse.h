@@ -96,6 +96,9 @@ public:
     void extract_bytes(uint8_t *buffer, std::size_t len);
     std::string extract_string();
 
+    /* Number of bytes remaining */
+    uint64_t remain() const;
+
     /* Checks that the whole block has been consumed. */
     void finish();
 

@@ -37,5 +37,11 @@
 #define DG_R_TEXT_AVMA        8
 #define DG_R_MALLOC_BLOCK     9
 #define DG_R_FREE_BLOCK      10
+#define DG_R_BBDEF           11
+#define DG_R_BBRUN           12
+
+#define DG_ACC_READ           0
+#define DG_ACC_WRITE          1
+#define DG_ACC_EXEC           2
 
 #endif /* __DG_RECORD_H */
