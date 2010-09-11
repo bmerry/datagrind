@@ -232,6 +232,8 @@ static void trace_bb_flush(DgBBRun *bbr)
       Word n_accesses = VG_(sizeXA)(bbr->accesses);
       ULong length = 2 + (bbr->n_ips + n_accesses) * sizeof(HWord);
 
+      tl_assert(bbr->n_ips > 0);
+
       out_byte(DG_R_BBRUN);
       out_length(length);
       out_byte(bbr->n_ips);
@@ -251,9 +253,15 @@ static void trace_bb_flush(DgBBRun *bbr)
 static VG_REGPARM(1) void trace_bb_start(Addr iaddr)
 {
    DgBBRun *bbr = &out_bbr;
+   ThreadId tid = VG_(get_running_tid)();
+   HWord ip = VG_(get_IP)(tid);
 
    trace_bb_flush(bbr);
-   bbr->n_ips = VG_(get_StackTrace)(VG_(get_running_tid)(), bbr->ips, STACK_DEPTH, NULL, NULL, 0);
+   bbr->n_ips = VG_(get_StackTrace)(tid, bbr->ips,
+                                    STACK_DEPTH, NULL, NULL,
+                                    iaddr - ip);
+   tl_assert(bbr->n_ips > 0);
+   tl_assert(iaddr == bbr->ips[0]);
 }
 
 static VG_REGPARM(1) void trace_access(Addr addr)
@@ -453,8 +461,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
             break;
          case Ist_Exit:
             dg_bbdef_update_instrs(sbOut, &bbd);
-            /* TODO: only needed when crossing function boundaries */
-            needs_flush = True;
+            /* TODO: needed when crossing function boundaries */
+            /* needs_flush = True; */
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_IMark:
@@ -472,8 +480,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                if (data->tag == Iex_Load)
                {
                   dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ,
-                                       data->Iex.Load.addr,
-                                       sizeofIRType(data->Iex.Load.ty));
+                                      data->Iex.Load.addr,
+                                      sizeofIRType(data->Iex.Load.ty));
                }
             }
             addStmtToIRSB(sbOut, st);
