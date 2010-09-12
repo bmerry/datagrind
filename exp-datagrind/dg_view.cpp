@@ -48,6 +48,7 @@
 
 using namespace std;
 
+/* Memory block allocated with malloc or similar function in the guest */
 struct mem_block
 {
     HWord addr;
@@ -56,6 +57,7 @@ struct mem_block
     string label;
 };
 
+/* Not stored anyway, only used to get information about accesses */
 struct mem_access
 {
     HWord addr;
@@ -67,6 +69,25 @@ struct mem_access
     vector<HWord> stack;
 
     mem_access() : addr(0), dir(0), size(0), block(NULL), iseq(0), stack() {}
+};
+
+struct context
+{
+    uint64_t bbdef_index;
+    vector<HWord> stack;
+
+    bool operator<(const context &b) const
+    {
+        if (bbdef_index != b.bbdef_index)
+            return bbdef_index < b.bbdef_index;
+        else
+            return stack < b.stack;
+    }
+
+    bool operator==(const context &b) const
+    {
+        return bbdef_index == b.bbdef_index && stack == b.stack;
+    }
 };
 
 struct bbdef_access
@@ -84,12 +105,10 @@ struct bbdef
 
 struct bbrun
 {
-    uint64_t bbdef_index;
     uint64_t iseq_start;
     uint64_t dseq_start;
-    uint8_t n_stack;
-    uint8_t n_addrs;              /* TODO need to ensure file limited to 255 accesses */
-    HWord *stack;                 /* Allocated from hword_pool */
+    set<context>::const_iterator ctx;
+    size_t n_addrs;
     HWord *addrs;                 /* Allocated from hword_pool; NULL means discarded */
     mem_block **blocks;           /* Allocated from mem_block_ptr_pool */
 };
@@ -131,6 +150,7 @@ static set<string> chosen_events;
 /* Ranges selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_ranges;
 
+static set<context> contexts;
 static vector<bbdef> bbdefs;
 static vector<bbrun> bbruns;
 static map<HWord, size_t> page_map;
@@ -154,7 +174,7 @@ static pair<double, size_t> nearest_access_bbrun(const bbrun &bbr, double addr, 
     double best_score = HUGE_VAL;
     size_t best_i = 0;
 
-    const bbdef &bbd = bbdefs[bbr.bbdef_index];
+    const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
     for (size_t i = 0; i < bbr.n_addrs; i++)
         if (bbr.addrs[i])
         {
@@ -222,7 +242,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
 
     if (best != bbruns.end())
     {
-        const bbdef &bbd = bbdefs[best->bbdef_index];
+        const bbdef &bbd = bbdefs[best->ctx->bbdef_index];
         assert(best_i < bbd.accesses.size());
         const bbdef_access &bbda = bbd.accesses[best_i];
         ans.addr = best->addrs[best_i];
@@ -232,7 +252,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
 
         assert(bbda.iseq < bbd.instr_addrs.size());
         ans.iseq = best->iseq_start + bbda.iseq;
-        ans.stack = vector<HWord>(best->stack, best->stack + best->n_stack);
+        ans.stack = best->ctx->stack;
         if (ans.stack.empty())
             ans.stack.resize(1);
         ans.stack[0] = bbd.instr_addrs[bbda.iseq];
@@ -362,25 +382,26 @@ static void load(const char *filename)
                     {
                         bbrun bbr;
                         bool keep_any = false;
+                        context ctx;
 
                         bbr.iseq_start = iseq;
                         bbr.dseq_start = dseq;
-                        bbr.bbdef_index = rp->extract_word();
-                        if (bbr.bbdef_index >= bbdefs.size())
+                        ctx.bbdef_index = rp->extract_word();
+                        if (ctx.bbdef_index >= bbdefs.size())
                         {
                             ostringstream msg;
-                            msg << "Error: bbdef index " << bbr.bbdef_index << " is out of range";
+                            msg << "Error: bbdef index " << ctx.bbdef_index << " is out of range";
                             throw record_parser_content_error(msg.str());
                         }
 
-                        bbr.n_stack = rp->extract_byte();
-                        if (bbr.n_stack == 0)
+                        uint8_t n_stack = rp->extract_byte();
+                        if (n_stack == 0)
                             throw record_parser_content_error("Error: empty call stack");
-                        bbr.stack = hword_pool.alloc(bbr.n_stack);
-                        for (uint8_t i = 0; i < bbr.n_stack; i++)
-                            bbr.stack[i] = rp->extract_word();
+                        ctx.stack.resize(n_stack);
+                        for (uint8_t i = 0; i < n_stack; i++)
+                            ctx.stack[i] = rp->extract_word();
 
-                        const bbdef &bbd = bbdefs[bbr.bbdef_index];
+                        const bbdef &bbd = bbdefs[ctx.bbdef_index];
                         uint8_t n_instrs = rp->extract_byte();
                         uint64_t n_addrs = rp->remain() / sizeof(HWord);
                         if (n_addrs > bbd.accesses.size())
@@ -410,7 +431,10 @@ static void load(const char *filename)
                         }
 
                         if (keep_any)
+                        {
+                            bbr.ctx = contexts.insert(ctx).first;
                             bbruns.push_back(bbr);
+                        }
                         iseq += n_instrs;
                         dseq += n_addrs;
                     }
@@ -512,6 +536,11 @@ static void load(const char *filename)
     }
     fclose(f);
 
+    /* bbruns is easily the largest structure, and due to the way vectors
+     * work, could be overcommitted. Shrink back to just fit. */
+    vector<bbrun> tmp(bbruns.begin(), bbruns.end());
+    bbruns.swap(tmp);
+
     size_t remapped_base = 0;
     for (map<HWord, size_t>::iterator i = page_map.begin(); i != page_map.end(); i++)
     {
@@ -519,6 +548,19 @@ static void load(const char *filename)
         remapped_base += DG_VIEW_PAGE_SIZE;
         rev_page_map[i->second] = i->first;
     }
+
+#if 1
+    printf("  %zu bbdefs\n"
+           "  %zu bbruns\n"
+           "  %zu contexts\n"
+           "  %zu instrs (approx)\n"
+           "  %zu accesses\n",
+           bbdefs.size(),
+           bbruns.size(),
+           contexts.size(),
+           bbruns.back().iseq_start,
+           bbruns.back().dseq_start + bbruns.back().n_addrs);
+#endif
 }
 
 static size_t remap_address(HWord a)
@@ -554,7 +596,7 @@ static size_t count_access_bytes(void)
         for (size_t j = 0; j < bbr.n_addrs; j++)
             if (bbr.addrs[j])
             {
-                const bbdef &bbd = bbdefs[bbr.bbdef_index];
+                const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
                 assert(j < bbd.accesses.size());
                 const bbdef_access &bbda = bbd.accesses[j];
                 total += bbda.size;
@@ -583,7 +625,7 @@ static void init_gl(void)
         for (size_t j = 0; j < bbr.n_addrs; j++)
             if (bbr.addrs[j])
             {
-                const bbdef &bbd = bbdefs[bbr.bbdef_index];
+                const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
                 assert(j < bbd.accesses.size());
                 const bbdef_access &bbda = bbd.accesses[j];
                 for (int k = 0; k < bbda.size; k++)
@@ -856,26 +898,6 @@ int main(int argc, char **argv)
         return 1;
     }
     init_gl();
-
-#if 0
-    set<vector<HWord> > ustacks;
-    for (size_t i = 0; i < bbruns.size(); i++)
-    {
-        const bbrun &b = bbruns[i];
-        ustacks.insert(vector<HWord>(b.stack, b.stack + b.n_stack));
-    }
-
-    printf("  %zu bbdefs\n"
-           "  %zu bbruns\n"
-           "  %zu unique stacks\n"
-           "  %zu instrs\n"
-           "  %zu accesses\n",
-           bbdefs.size(),
-           bbruns.size(),
-           ustacks.size(),
-           bbruns.back().iseq_start,
-           bbruns.back().dseq_start + bbruns.back().n_addrs);
-#endif
 
     glutMainLoop();
 
