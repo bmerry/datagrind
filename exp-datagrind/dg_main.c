@@ -95,12 +95,14 @@ typedef struct
 
 typedef struct
 {
+   ULong index;
    XArray *instrs;
    XArray *accesses;
 } DgBBDef;
 
 typedef struct
 {
+   ULong bbdef_index;
    UInt n_ips;
    Addr ips[STACK_DEPTH];
    HWord n_instrs;
@@ -111,6 +113,7 @@ static Int out_fd = -1;
 static UChar out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
 static DgBBRun out_bbr;
+static ULong global_bbdef_index = 0;
 
 static VgHashTable debuginfo_table = NULL;
 static Bool debuginfo_dirty = True;
@@ -230,12 +233,13 @@ static void trace_bb_flush(DgBBRun *bbr)
    {
       UInt i;
       Word n_accesses = VG_(sizeXA)(bbr->accesses);
-      ULong length = 2 + (bbr->n_ips + n_accesses) * sizeof(HWord);
+      ULong length = 2 + (1 + bbr->n_ips + n_accesses) * sizeof(HWord);
 
       tl_assert(bbr->n_ips > 0);
 
       out_byte(DG_R_BBRUN);
       out_length(length);
+      out_word(bbr->bbdef_index);
       out_byte(bbr->n_ips);
       for (i = 0; i < bbr->n_ips; i++)
          out_word(bbr->ips[i]);
@@ -269,9 +273,10 @@ static VG_REGPARM(1) void trace_access(Addr addr)
    VG_(addToXA)(out_bbr.accesses, &addr);
 }
 
-static VG_REGPARM(1) void trace_update_instrs(HWord n_instrs)
+static VG_REGPARM(2) void trace_update_instrs(HWord n_instrs, HWord bbdef_index)
 {
    out_bbr.n_instrs = n_instrs;
+   out_bbr.bbdef_index = bbdef_index;
 }
 
 static void clean_debuginfo(void)
@@ -306,6 +311,7 @@ static void clean_debuginfo(void)
 
 static void dg_bbdef_init(DgBBDef *bbd)
 {
+   bbd->index = global_bbdef_index;
    bbd->instrs = VG_(newXA)(VG_(malloc), "datagrind.instrs", VG_(free), sizeof(DgBBDefInstr));
    bbd->accesses = VG_(newXA)(VG_(malloc), "datagrind.accesses", VG_(free), sizeof(DgBBDefAccess));
 }
@@ -342,12 +348,16 @@ static void dg_bbdef_flush(DgBBDef *bbd)
    /* Empty the arrays */
    VG_(dropTailXA)(bbd->instrs, n_instrs);
    VG_(dropTailXA)(bbd->accesses, n_accesses);
+
+   /* Prepare for the next one */
+   bbd->index++;
 }
 
 static void dg_bbdef_destroy(DgBBDef *bbd)
 {
    VG_(deleteXA)(bbd->instrs);
    VG_(deleteXA)(bbd->accesses);
+   global_bbdef_index = bbd->index;
 }
 
 static void dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size)
@@ -410,8 +420,8 @@ static void dg_bbdef_update_instrs(IRSB *sbOut, DgBBDef *bbd)
    if (n_instrs == 0)
       return;
 
-   argv = mkIRExprVec_1(mkIRExpr_HWord(n_instrs));
-   di = unsafeIRDirty_0_N(1, (Char *) "trace_update_instrs",
+   argv = mkIRExprVec_2(mkIRExpr_HWord(n_instrs), mkIRExpr_HWord(bbd->index));
+   di = unsafeIRDirty_0_N(2, (Char *) "trace_update_instrs",
                           VG_(fnptr_to_fnentry)(&trace_update_instrs), argv);
    addStmtToIRSB(sbOut, IRStmt_Dirty(di));
 }
