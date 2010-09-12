@@ -60,13 +60,12 @@ struct mem_access
     HWord addr;
     uint8_t dir;
     uint8_t size;
-    HWord iaddr;
-    uint64_t iseq;
     mem_block *block;
 
-    mem_access() {}
-    mem_access(HWord addr, uint8_t dir, uint8_t size, HWord iaddr, uint64_t iseq, mem_block *block)
-        : addr(addr), dir(dir), size(size), iaddr(iaddr), iseq(iseq), block(block) {}
+    uint64_t iseq;
+    vector<HWord> stack;
+
+    mem_access() : addr(0), dir(0), size(0), block(NULL), iseq(0), stack() {}
 };
 
 struct bbdef_access
@@ -88,25 +87,26 @@ struct bbrun
     uint64_t iseq_start;
     uint64_t dseq_start;
     vector<HWord> stack;
-    vector<HWord> addresses;
-    vector<mem_block *> blocks;
+    vector<HWord> addrs;
+    vector<mem_block *> blocks;   /* pointers to memory blocks, same indexing as addrs */
+    vector<bool> keep;            /* whether to display the access, same indexing as addrs */
 };
 
-struct compare_mem_access_iseq
+struct compare_bbrun_iseq
 {
-    bool operator()(const mem_access &a, const mem_access &b) const
+    bool operator()(const bbrun &a, const bbrun &b) const
     {
-        return a.iseq < b.iseq;
+        return a.iseq_start < b.iseq_start;
     }
 
-    bool operator()(const mem_access &a, uint64_t iseq) const
+    bool operator()(const bbrun &a, uint64_t iseq) const
     {
-        return a.iseq < iseq;
+        return a.iseq_start < iseq;
     }
 
-    bool operator()(uint64_t iseq, const mem_access &a) const
+    bool operator()(uint64_t iseq, const bbrun &a) const
     {
-        return iseq < a.iseq;
+        return iseq < a.iseq_start;
     }
 };
 
@@ -128,7 +128,6 @@ static set<string> chosen_ranges;
 
 static vector<bbdef> bbdefs;
 static vector<bbrun> bbruns;
-static vector<mem_access> accesses;
 static map<HWord, size_t> page_map;
 static map<size_t, HWord> rev_page_map;
 
@@ -139,58 +138,103 @@ template<typename T> T page_round_down(T x)
     return x & ~(DG_VIEW_PAGE_SIZE - 1);
 }
 
-static vector<mem_access>::iterator nearest_access(double addr, double iseq, double addr_scale, double iseq_scale)
+/* ratio is the ratio of address scale to iseq scale: a large value for ratio
+ * increases the importance of the address in the match.
+ *
+ * Returns the best score and best index for the block. If there were no
+ * usable addresses, returns score of HUGE_VAL;
+ */
+static pair<double, size_t> nearest_access_bbrun(const bbrun &bbr, double addr, double iseq, double ratio)
+{
+    double best_score = HUGE_VAL;
+    size_t best_i = 0;
+
+    const bbdef &bbd = bbdefs[bbr.bbdef_index];
+    for (size_t i = 0; i < bbr.keep.size(); i++)
+        if (bbr.keep[i])
+        {
+            double addr_score = (bbr.addrs[i] - addr) * ratio;
+            uint64_t cur_iseq = bbr.iseq_start + bbd.accesses[i].iseq;
+            double score = hypot(addr_score, cur_iseq - iseq);
+            if (score < best_score)
+            {
+                best_score = score;
+                best_i = i;
+            }
+        }
+    return make_pair(best_score, best_i);
+}
+
+static mem_access nearest_access(double addr, double iseq, double ratio)
 {
     /* Start at the right instruction and search outwards until we can bound
      * the search.
      */
-    vector<mem_access>::iterator back, forw, best;
+    vector<bbrun>::const_iterator back, forw, best = bbruns.end();
+    size_t best_i;
     double best_score = HUGE_VAL;
 
-    forw = lower_bound(accesses.begin(), accesses.end(), (uint64_t) iseq, compare_mem_access_iseq());
+    forw = lower_bound(bbruns.begin(), bbruns.end(), (uint64_t) iseq, compare_bbrun_iseq());
     back = forw;
     best = forw;
-    while (forw != accesses.end() || back != accesses.begin())
+    while (forw != bbruns.end() || back != bbruns.begin())
     {
-        if (forw != accesses.end())
+        if (forw != bbruns.end())
         {
-            double iseq_score = (forw->iseq - iseq) * iseq_scale;
-            if (iseq_score > best_score)
-                forw = accesses.end();
+            if (forw->iseq_start > iseq + best_score)
+                forw = bbruns.end();
             else
             {
-                double addr_score = (forw->addr - addr) * addr_scale;
-                double score = hypot(addr_score, iseq_score);
-                if (score < best_score)
+                pair<double, size_t> sub = nearest_access_bbrun(*forw, addr, iseq, ratio);
+                if (sub.first < best_score)
                 {
-                    best_score = score;
+                    best_score = sub.first;
+                    best_i = sub.second;
                     best = forw;
                 }
-                ++forw;
+                forw++;
             }
         }
-        if (back != accesses.begin())
+        if (back != bbruns.begin())
         {
-            --back;
-            double iseq_score = (iseq - back->iseq) * iseq_scale;
-            if (iseq_scale > best_score)
-                back = accesses.begin();
+            if (back->iseq_start <= iseq - best_score)
+                back = bbruns.begin();
             else
             {
-                double addr_score = (back->addr - addr) * addr_scale;
-                double score = hypot(addr_score, iseq_score);
-                if (score < best_score)
+                --back;
+                pair<double, size_t> sub = nearest_access_bbrun(*back, addr, iseq, ratio);
+                if (sub.first < best_score)
                 {
-                    best_score = score;
-                    best = back;
+                    best_score = sub.first;
+                    best_i = sub.second;
+                    best = forw;
                 }
             }
         }
     }
-    return best;
+
+    mem_access ans;
+
+    if (best != bbruns.end())
+    {
+        const bbdef &bbd = bbdefs[best->bbdef_index];
+        const bbdef_access &bbda = bbd.accesses[best_i];
+        ans.addr = best->addrs[best_i];
+        ans.dir = bbda.dir;
+        ans.size = bbda.size;
+        ans.block = best->blocks[best_i];
+
+        assert(bbda.iseq < bbd.instr_addrs.size());
+        ans.iseq = best->iseq_start + bbda.iseq;
+        ans.stack = best->stack;
+        if (ans.stack.empty())
+            ans.stack.resize(1);
+        ans.stack[0] = bbd.instr_addrs[bbda.iseq];
+    }
+    return ans;
 }
 
-static void add_access(HWord addr, uint8_t dir, uint8_t size, HWord iaddr, uint64_t iseq)
+static bool keep_access(HWord addr, uint8_t size)
 {
     bool matched;
     if (!chosen_events.empty() && active_events.empty())
@@ -210,15 +254,16 @@ static void add_access(HWord addr, uint8_t dir, uint8_t size, HWord iaddr, uint6
     else
         matched = true;
 
-    if (matched)
-    {
-        mem_block *block = NULL;
-        rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
-        if (block_it != block_map.end())
-            block = block_it->second;
-        accesses.push_back(mem_access(addr, dir, size, iaddr, iseq, block));
-        page_map[page_round_down(addr)] = 0;
-    }
+    return matched;
+}
+
+static mem_block *find_block(HWord addr)
+{
+    mem_block *block = NULL;
+    rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
+    if (block_it != block_map.end())
+        block = block_it->second;
+    return block;
 }
 
 static void load(const char *filename)
@@ -226,7 +271,6 @@ static void load(const char *filename)
     bool first = true;
     uint64_t iseq = 0;
     uint64_t dseq = 0;
-    HWord iaddr = 0;
     record_parser *rp_ptr;
 
     FILE *f = fopen(filename, "r");
@@ -307,7 +351,10 @@ static void load(const char *filename)
                 case DG_R_BBRUN:
                     {
                         bbrun bbr;
+                        bool keep_any = false;
 
+                        bbr.iseq_start = iseq;
+                        bbr.dseq_start = dseq;
                         bbr.bbdef_index = rp->extract_word();
                         if (bbr.bbdef_index >= bbdefs.size())
                         {
@@ -329,39 +376,30 @@ static void load(const char *filename)
                         if (n_addrs > bbd.accesses.size())
                             throw record_parser_content_error("Error: too many access addresses");
 
+                        bbr.addrs.reserve(n_addrs);
+                        bbr.blocks.reserve(n_addrs);
+                        bbr.keep.reserve(n_addrs);
                         for (HWord i = 0; i < n_addrs; i++)
                         {
                             HWord addr = rp->extract_word();
                             const bbdef_access &access = bbd.accesses[i];
-                            add_access(addr, access.dir, access.size, bbd.instr_addrs[access.iseq], iseq + access.iseq);
+
+                            bool keep = keep_access(addr, access.size);
+                            // add_access(addr, access.dir, access.size, bbd.instr_addrs[access.iseq], iseq + access.iseq);
+                            bbr.addrs.push_back(addr);
+                            bbr.blocks.push_back(find_block(addr));
+                            bbr.keep.push_back(keep);
+                            if (keep)
+                            {
+                                keep_any = true;
+                                page_map[page_round_down(addr)] = 0;
+                            }
                         }
 
-                        bbruns.push_back(bbr);
+                        if (keep_any)
+                            bbruns.push_back(bbr);
                         iseq += n_instrs;
                         dseq += n_addrs;
-                    }
-                    break;
-                case DG_R_INSTR:
-                    {
-                        /* size = */ rp->extract_byte();
-                        iaddr = rp->extract_word();
-                        iseq++;
-                    }
-                    break;
-                case DG_R_READ:
-                    {
-                        uint8_t size = rp->extract_byte();
-                        HWord addr = rp->extract_word();
-                        add_access(addr, DG_ACC_READ, size, iaddr, iseq);
-                        dseq++;
-                    }
-                    break;
-                case DG_R_WRITE:
-                    {
-                        uint8_t size = rp->extract_byte();
-                        HWord addr = rp->extract_word();
-                        add_access(addr, DG_ACC_WRITE, size, iaddr, iseq);
-                        dseq++;
                     }
                     break;
                 case DG_R_TRACK_RANGE:
@@ -497,8 +535,18 @@ static GLint zoom_x, zoom_y;
 static size_t count_access_bytes(void)
 {
     size_t total = 0;
-    for (size_t i = 0; i < accesses.size(); i++)
-        total += accesses[i].size;
+    for (size_t i = 0; i < bbruns.size(); i++)
+    {
+        bbrun &bbr = bbruns[i];
+        for (size_t j = 0; j < bbr.keep.size(); j++)
+            if (bbr.keep[j])
+            {
+                const bbdef &bbd = bbdefs[bbr.bbdef_index];
+                assert(j < bbd.accesses.size());
+                const bbdef_access &bbda = bbd.accesses[j];
+                total += bbda.size;
+            }
+    }
     return total;
 }
 
@@ -516,28 +564,36 @@ static void init_gl(void)
     max_x = -HUGE_VALF;
 
     size_t v = 0;
-    for (size_t i = 0; i < accesses.size(); i++)
+    for (size_t i = 0; i < bbruns.size(); i++)
     {
-        for (int j = 0; j < accesses[i].size; j++)
-        {
-            vertices[v].pos[0] = remap_address(accesses[i].addr) + j;
-            vertices[v].pos[1] = accesses[i].iseq;
-            min_x = min(min_x, vertices[v].pos[0]);
-            max_x = max(max_x, vertices[v].pos[0]);
-            switch (accesses[i].dir)
+        bbrun &bbr = bbruns[i];
+        for (size_t j = 0; j < bbr.keep.size(); j++)
+            if (bbr.keep[j])
             {
-            case DG_ACC_READ:
-                memcpy(vertices[v].color, color_read, sizeof(color_read));
-                break;
-            case DG_ACC_WRITE:
-                memcpy(vertices[v].color, color_write, sizeof(color_write));
-                break;
-            case DG_ACC_EXEC:
-                memcpy(vertices[v].color, color_instr, sizeof(color_instr));
-                break;
+                const bbdef &bbd = bbdefs[bbr.bbdef_index];
+                assert(j < bbd.accesses.size());
+                const bbdef_access &bbda = bbd.accesses[j];
+                for (int k = 0; k < bbda.size; k++)
+                {
+                    vertices[v].pos[0] = remap_address(bbr.addrs[j]) + k;
+                    vertices[v].pos[1] = bbr.iseq_start + bbda.iseq;
+                    min_x = min(min_x, vertices[v].pos[0]);
+                    max_x = max(max_x, vertices[v].pos[0]);
+                    switch (bbda.dir)
+                    {
+                    case DG_ACC_READ:
+                        memcpy(vertices[v].color, color_read, sizeof(color_read));
+                        break;
+                    case DG_ACC_WRITE:
+                        memcpy(vertices[v].color, color_write, sizeof(color_write));
+                        break;
+                    case DG_ACC_EXEC:
+                        memcpy(vertices[v].color, color_instr, sizeof(color_instr));
+                        break;
+                    }
+                    v++;
+                }
             }
-            v++;
-        }
     }
     assert(v == num_vertices);
 
@@ -654,12 +710,13 @@ static void mouse(int button, int state, int x, int y)
 
             double addr_scale = window_width / (max_x - min_x);
             double seq_scale = window_height / (max_y - min_y);
+            double ratio = addr_scale / seq_scale;
 
-            vector<mem_access>::const_iterator access = nearest_access(addr, seq, addr_scale, seq_scale);
-            if (access != accesses.end())
+            mem_access access = nearest_access(addr, seq, ratio);
+            if (access.size != 0)
             {
-                printf("Nearest access: %#zx", access->addr);
-                mem_block *block = access->block;
+                printf("Nearest access: %#zx", access.addr);
+                mem_block *block = access.block;
                 if (block != NULL)
                 {
                     printf(": %zu bytes inside a block of size %zu, allocated at\n",
@@ -673,10 +730,14 @@ static void mouse(int button, int state, int x, int y)
                 else
                     printf("\n");
 
-                if (access->iaddr != 0)
+                if (!access.stack.empty())
                 {
-                    string loc = addr2line(access->iaddr);
-                    printf("At %s\n", loc.c_str());
+                    printf("At\n");
+                    for (size_t i = 0; i < access.stack.size();i++)
+                    {
+                        string loc = addr2line(access.stack[i]);
+                        printf("  %s\n", loc.c_str());
+                    }
                 }
             }
         }
@@ -763,7 +824,7 @@ int main(int argc, char **argv)
         usage(argv[0], 2);
     }
     load(argv[1]);
-    if (accesses.empty())
+    if (bbruns.empty())
     {
         fprintf(stderr, "No accesses match the criteria.\n");
         return 0;
