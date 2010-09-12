@@ -48,8 +48,7 @@
 #include "datagrind.h"
 #include "dg_record.h"
 
-#define STACK_DEPTH 4
-#define NEVENTS 4
+#define STACK_DEPTH 8
 #define OUT_BUF_SIZE 4096
 
 typedef enum
