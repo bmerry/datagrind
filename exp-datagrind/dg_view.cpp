@@ -207,7 +207,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
                 {
                     best_score = sub.first;
                     best_i = sub.second;
-                    best = forw;
+                    best = back;
                 }
             }
         }
@@ -218,6 +218,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
     if (best != bbruns.end())
     {
         const bbdef &bbd = bbdefs[best->bbdef_index];
+        assert(best_i < bbd.accesses.size());
         const bbdef_access &bbda = bbd.accesses[best_i];
         ans.addr = best->addrs[best_i];
         ans.dir = bbda.dir;
@@ -344,6 +345,10 @@ static void load(const char *filename)
                             bbd.accesses[i].dir = rp->extract_byte();
                             bbd.accesses[i].size = rp->extract_byte();
                             bbd.accesses[i].iseq = rp->extract_byte();
+                            if (bbd.accesses[i].iseq >= n_instrs)
+                            {
+                                throw record_parser_content_error("iseq is greater than instruction count");
+                            }
                         }
                         bbdefs.push_back(bbd);
                     }
@@ -843,6 +848,16 @@ int main(int argc, char **argv)
         return 1;
     }
     init_gl();
+
+    printf("  %zu bbdefs\n"
+           "  %zu bbruns\n"
+           "  %zu instrs\n"
+           "  %zu accesses\n",
+           bbdefs.size(),
+           bbruns.size(),
+           bbruns.back().iseq_start,
+           bbruns.back().dseq_start + bbruns.back().addrs.size());
+
     glutMainLoop();
 
     return 0;
