@@ -44,6 +44,7 @@
 #include "dg_view_range.h"
 #include "dg_view_debuginfo.h"
 #include "dg_view_parse.h"
+#include "dg_view_pool.h"
 
 using namespace std;
 
@@ -86,10 +87,11 @@ struct bbrun
     uint64_t bbdef_index;
     uint64_t iseq_start;
     uint64_t dseq_start;
-    vector<HWord> stack;
-    vector<HWord> addrs;
-    vector<mem_block *> blocks;   /* pointers to memory blocks, same indexing as addrs */
-    vector<bool> keep;            /* whether to display the access, same indexing as addrs */
+    uint8_t n_stack;
+    uint8_t n_addrs;              /* TODO need to ensure file limited to 255 accesses */
+    HWord *stack;                 /* Allocated from hword_pool */
+    HWord *addrs;                 /* Allocated from hword_pool; NULL means discarded */
+    mem_block **blocks;           /* Allocated from mem_block_ptr_pool */
 };
 
 struct compare_bbrun_iseq
@@ -112,6 +114,9 @@ struct compare_bbrun_iseq
 
 #define DG_VIEW_PAGE_SIZE 4096
 #define DG_VIEW_LINE_SIZE 64
+
+static pool_allocator<HWord> hword_pool;
+static pool_allocator<mem_block *> mem_block_ptr_pool;
 
 /* All START_EVENTs with no matching END_EVENT from chosen_events */
 static multiset<string> active_events;
@@ -150,8 +155,8 @@ static pair<double, size_t> nearest_access_bbrun(const bbrun &bbr, double addr, 
     size_t best_i = 0;
 
     const bbdef &bbd = bbdefs[bbr.bbdef_index];
-    for (size_t i = 0; i < bbr.keep.size(); i++)
-        if (bbr.keep[i])
+    for (size_t i = 0; i < bbr.n_addrs; i++)
+        if (bbr.addrs[i])
         {
             double addr_score = (bbr.addrs[i] - addr) * ratio;
             uint64_t cur_iseq = bbr.iseq_start + bbd.accesses[i].iseq;
@@ -227,7 +232,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
 
         assert(bbda.iseq < bbd.instr_addrs.size());
         ans.iseq = best->iseq_start + bbda.iseq;
-        ans.stack = best->stack;
+        ans.stack = vector<HWord>(best->stack, best->stack + best->n_stack);
         if (ans.stack.empty())
             ans.stack.resize(1);
         ans.stack[0] = bbd.instr_addrs[bbda.iseq];
@@ -368,11 +373,11 @@ static void load(const char *filename)
                             throw record_parser_content_error(msg.str());
                         }
 
-                        uint8_t n_stack = rp->extract_byte();
-                        if (n_stack == 0)
+                        bbr.n_stack = rp->extract_byte();
+                        if (bbr.n_stack == 0)
                             throw record_parser_content_error("Error: empty call stack");
-                        bbr.stack.resize(n_stack);
-                        for (uint8_t i = 0; i < n_stack; i++)
+                        bbr.stack = hword_pool.alloc(bbr.n_stack);
+                        for (uint8_t i = 0; i < bbr.n_stack; i++)
                             bbr.stack[i] = rp->extract_word();
 
                         const bbdef &bbd = bbdefs[bbr.bbdef_index];
@@ -381,23 +386,26 @@ static void load(const char *filename)
                         if (n_addrs > bbd.accesses.size())
                             throw record_parser_content_error("Error: too many access addresses");
 
-                        bbr.addrs.reserve(n_addrs);
-                        bbr.blocks.reserve(n_addrs);
-                        bbr.keep.reserve(n_addrs);
+                        bbr.n_addrs = n_addrs;
+                        bbr.addrs = hword_pool.alloc(n_addrs);
+                        bbr.blocks = mem_block_ptr_pool.alloc(n_addrs);
                         for (HWord i = 0; i < n_addrs; i++)
                         {
                             HWord addr = rp->extract_word();
                             const bbdef_access &access = bbd.accesses[i];
 
                             bool keep = keep_access(addr, access.size);
-                            // add_access(addr, access.dir, access.size, bbd.instr_addrs[access.iseq], iseq + access.iseq);
-                            bbr.addrs.push_back(addr);
-                            bbr.blocks.push_back(find_block(addr));
-                            bbr.keep.push_back(keep);
                             if (keep)
                             {
                                 keep_any = true;
                                 page_map[page_round_down(addr)] = 0;
+                                bbr.addrs[i] = addr;
+                                bbr.blocks[i] = find_block(addr);
+                            }
+                            else
+                            {
+                                bbr.addrs[i] = 0;
+                                bbr.blocks[i] = NULL;
                             }
                         }
 
@@ -543,8 +551,8 @@ static size_t count_access_bytes(void)
     for (size_t i = 0; i < bbruns.size(); i++)
     {
         bbrun &bbr = bbruns[i];
-        for (size_t j = 0; j < bbr.keep.size(); j++)
-            if (bbr.keep[j])
+        for (size_t j = 0; j < bbr.n_addrs; j++)
+            if (bbr.addrs[j])
             {
                 const bbdef &bbd = bbdefs[bbr.bbdef_index];
                 assert(j < bbd.accesses.size());
@@ -572,8 +580,8 @@ static void init_gl(void)
     for (size_t i = 0; i < bbruns.size(); i++)
     {
         bbrun &bbr = bbruns[i];
-        for (size_t j = 0; j < bbr.keep.size(); j++)
-            if (bbr.keep[j])
+        for (size_t j = 0; j < bbr.n_addrs; j++)
+            if (bbr.addrs[j])
             {
                 const bbdef &bbd = bbdefs[bbr.bbdef_index];
                 assert(j < bbd.accesses.size());
@@ -849,14 +857,25 @@ int main(int argc, char **argv)
     }
     init_gl();
 
+#if 0
+    set<vector<HWord> > ustacks;
+    for (size_t i = 0; i < bbruns.size(); i++)
+    {
+        const bbrun &b = bbruns[i];
+        ustacks.insert(vector<HWord>(b.stack, b.stack + b.n_stack));
+    }
+
     printf("  %zu bbdefs\n"
            "  %zu bbruns\n"
+           "  %zu unique stacks\n"
            "  %zu instrs\n"
            "  %zu accesses\n",
            bbdefs.size(),
            bbruns.size(),
+           ustacks.size(),
            bbruns.back().iseq_start,
-           bbruns.back().dseq_start + bbruns.back().addrs.size());
+           bbruns.back().dseq_start + bbruns.back().n_addrs);
+#endif
 
     glutMainLoop();
 
