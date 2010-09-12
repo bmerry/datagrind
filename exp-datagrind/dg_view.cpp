@@ -51,7 +51,7 @@ struct mem_block
 {
     HWord addr;
     HWord size;
-    vector<HWord> stack_trace;
+    vector<HWord> stack;
     string label;
 };
 
@@ -84,11 +84,12 @@ struct bbdef
 
 struct bbrun
 {
-    bbdef *bb;
+    uint64_t bbdef_index;
     uint64_t iseq_start;
     uint64_t dseq_start;
-    vector<HWord> stack_trace;
+    vector<HWord> stack;
     vector<HWord> addresses;
+    vector<mem_block *> blocks;
 };
 
 struct compare_mem_access_iseq
@@ -125,7 +126,8 @@ static set<string> chosen_events;
 /* Ranges selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_ranges;
 
-static map<HWord, bbdef> bbdef_map;
+static vector<bbdef> bbdefs;
+static vector<bbrun> bbruns;
 static vector<mem_access> accesses;
 static map<HWord, size_t> page_map;
 static map<size_t, HWord> rev_page_map;
@@ -276,6 +278,7 @@ static void load(const char *filename)
 
                 case DG_R_BBDEF:
                     {
+                        bbdef bbd;
                         uint8_t n_instrs = rp->extract_byte();
                         HWord n_accesses = rp->extract_word();
 
@@ -283,49 +286,44 @@ static void load(const char *filename)
                         {
                             throw record_parser_content_error("Error: empty BB");
                         }
-                        vector<HWord> instr_addrs(n_instrs);
-                        vector<bbdef_access> accesses(n_accesses);
+                        bbd.instr_addrs.resize(n_instrs);
+                        bbd.accesses.resize(n_accesses);
 
                         for (HWord i = 0; i < n_instrs; i++)
                         {
-                            instr_addrs[i] = rp->extract_word();
+                            bbd.instr_addrs[i] = rp->extract_word();
                             // discard size
                             (void) rp->extract_byte();
                         }
                         for (HWord i = 0; i < n_accesses; i++)
                         {
-                            accesses[i].dir = rp->extract_byte();
-                            accesses[i].size = rp->extract_byte();
-                            accesses[i].iseq = rp->extract_byte();
+                            bbd.accesses[i].dir = rp->extract_byte();
+                            bbd.accesses[i].size = rp->extract_byte();
+                            bbd.accesses[i].iseq = rp->extract_byte();
                         }
-                        if (bbdef_map.count(instr_addrs[0]))
-                        {
-                            printf("Warning: duplicate bb at %#lx\n", instr_addrs[0]);
-                        }
-                        bbdef &bbd = bbdef_map[instr_addrs[0]];
-                        bbd.instr_addrs.swap(instr_addrs);
-                        bbd.accesses.swap(accesses);
+                        bbdefs.push_back(bbd);
                     }
                     break;
                 case DG_R_BBRUN:
                     {
                         bbrun bbr;
-                        uint8_t n_stack = rp->extract_byte();
-                        if (n_stack == 0)
-                            throw record_parser_content_error("Error: empty call stack");
-                        vector<HWord> stack(n_stack);
-                        for (uint8_t i = 0; i < n_stack; i++)
-                            stack[i] = rp->extract_word();
 
-                        if (!bbdef_map.count(stack[0]))
+                        bbr.bbdef_index = rp->extract_word();
+                        if (bbr.bbdef_index >= bbdefs.size())
                         {
                             ostringstream msg;
-                            msg << "Error: no bbdef found for address ";
-                            msg << hex << showbase << stack[0];
+                            msg << "Error: bbdef index " << bbr.bbdef_index << " is out of range";
                             throw record_parser_content_error(msg.str());
                         }
 
-                        const bbdef &bbd = bbdef_map[stack[0]];
+                        uint8_t n_stack = rp->extract_byte();
+                        if (n_stack == 0)
+                            throw record_parser_content_error("Error: empty call stack");
+                        bbr.stack.resize(n_stack);
+                        for (uint8_t i = 0; i < n_stack; i++)
+                            bbr.stack[i] = rp->extract_word();
+
+                        const bbdef &bbd = bbdefs[bbr.bbdef_index];
                         uint8_t n_instrs = rp->extract_byte();
                         uint64_t n_addrs = rp->remain() / sizeof(HWord);
                         if (n_addrs > bbd.accesses.size())
@@ -338,6 +336,7 @@ static void load(const char *filename)
                             add_access(addr, access.dir, access.size, bbd.instr_addrs[access.iseq], iseq + access.iseq);
                         }
 
+                        bbruns.push_back(bbr);
                         iseq += n_instrs;
                         dseq += n_addrs;
                     }
@@ -398,11 +397,11 @@ static void load(const char *filename)
                         mem_block *block = new mem_block;
                         block->addr = addr;
                         block->size = size;
-                        block->stack_trace.reserve(n_ips);
+                        block->stack.reserve(n_ips);
                         for (HWord i = 0; i < n_ips; i++)
                         {
                             HWord stack_addr = rp->extract_word();
-                            block->stack_trace.push_back(stack_addr);
+                            block->stack.push_back(stack_addr);
                         }
                         block_storage.push_back(block);
                         block_map.insert(addr, addr + size, block);
@@ -665,9 +664,9 @@ static void mouse(int button, int state, int x, int y)
                 {
                     printf(": %zu bytes inside a block of size %zu, allocated at\n",
                            addr - block->addr, block->size);
-                    for (size_t i = 0; i < block->stack_trace.size(); i++)
+                    for (size_t i = 0; i < block->stack.size(); i++)
                     {
-                        string loc = addr2line(block->stack_trace[i]);
+                        string loc = addr2line(block->stack[i]);
                         printf("  %s\n", loc.c_str());
                     }
                 }

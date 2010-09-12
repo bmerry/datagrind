@@ -293,12 +293,13 @@ struct bbdef
 
 struct bbrun
 {
-    byte record_type;    // DG_R_BBRUN
+    byte record_type;     // DG_R_BBRUN
     byte record_length;
+    HWord bbdef_index;    // index into sequence of bbdefs in the file
     byte n_stack;
-    HWord stack[n_stack];// call stack at start of block
-    byte n_instrs;       // number of instructions executed before leaving
-    HWord addrs[];       // length determined from record size
+    HWord stack[n_stack]; // call stack at start of block
+    byte n_instrs;        // number of instructions executed before leaving
+    HWord addrs[];        // length determined from record size
 };]]>
 </screen>
 </sect2>
