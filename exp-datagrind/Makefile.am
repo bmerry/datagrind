@@ -8,7 +8,8 @@ EXTRA_DIST = docs/dg-manual.xml
 
 pkginclude_HEADERS = datagrind.h
 
-noinst_HEADERS = dg_record.h dg_view_range.h dg_view_debuginfo.h dg_view_parse.h dg_view.h
+noinst_HEADERS = dg_record.h dg_view_range.h dg_view_debuginfo.h \
+                 dg_view_parse.h dg_view_pool.h dg_view.h
 
 #----------------------------------------------------------------------------
 # dg_view
