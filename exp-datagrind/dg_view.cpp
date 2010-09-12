@@ -141,6 +141,7 @@ static pool_allocator<mem_block *> mem_block_ptr_pool;
 static multiset<string> active_events;
 /* All TRACK_RANGEs with no matching UNTRACK_RANGE from chosen_ranges */
 static multiset<pair<HWord, HWord> > active_ranges;
+static bool malloc_only = false;
 
 static rangemap<HWord, mem_block *> block_map;
 static vector<mem_block *> block_storage;
@@ -260,6 +261,15 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
     return ans;
 }
 
+static mem_block *find_block(HWord addr)
+{
+    mem_block *block = NULL;
+    rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
+    if (block_it != block_map.end())
+        block = block_it->second;
+    return block;
+}
+
 static bool keep_access(HWord addr, uint8_t size)
 {
     bool matched;
@@ -280,16 +290,10 @@ static bool keep_access(HWord addr, uint8_t size)
     else
         matched = true;
 
-    return matched;
-}
+    if (matched && malloc_only && find_block(addr) == NULL)
+        matched = false;
 
-static mem_block *find_block(HWord addr)
-{
-    mem_block *block = NULL;
-    rangemap<HWord, mem_block *>::iterator block_it = block_map.find(addr);
-    if (block_it != block_map.end())
-        block = block_it->second;
-    return block;
+    return matched;
 }
 
 static void load(const char *filename)
@@ -835,11 +839,12 @@ static void parse_opts(int *argc, char **argv)
     {
         { "ranges", 1, NULL, 'r' },
         { "events", 1, NULL, 'e' },
+        { "malloc-only", 0, NULL, 'm' },
         { NULL, 0, NULL, 0 }
     };
     int opt;
 
-    while ((opt = getopt_long(*argc, argv, "r:e:", longopts, NULL)) != -1)
+    while ((opt = getopt_long(*argc, argv, "r:e:m", longopts, NULL)) != -1)
     {
         switch (opt)
         {
@@ -854,6 +859,9 @@ static void parse_opts(int *argc, char **argv)
                 vector<string> events = split_comma(optarg);
                 chosen_events = set<string>(events.begin(), events.end());
             }
+            break;
+        case 'm':
+            malloc_only = true;
             break;
         case '?':
         case ':':
