@@ -222,7 +222,16 @@ string addr2line(HWord addr)
                 if (info.found)
                 {
                     if (info.function != NULL && info.function[0])
-                        label << " in " << info.function;
+                    {
+                        char *demangled = bfd_demangle(osf->abfd, info.function, 0);
+                        if (demangled != NULL)
+                        {
+                            label << " in " << demangled;
+                            free(demangled);
+                        }
+                        else
+                            label << " in " << info.function;
+                    }
                     label << " (";
                     if (info.source)
                     {
