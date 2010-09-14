@@ -39,6 +39,7 @@
 #define DG_R_FREE_BLOCK      10
 #define DG_R_BBDEF           11
 #define DG_R_BBRUN           12
+#define DG_R_CONTEXT         13
 
 #define DG_ACC_READ           0
 #define DG_ACC_WRITE          1

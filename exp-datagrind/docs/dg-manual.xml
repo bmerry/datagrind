@@ -192,22 +192,6 @@ struct header
 </screen>
 </sect2>
 
-<sect2 id="dg-manual.record-access" xreflabel="Data access">
-<title>Access</title>
-<para>
-These are the main record types, indicating a read or write access.
-</para>
-<screen><![CDATA[
-struct access
-{
-    byte record_type;   // DG_R_READ or DG_R_WRITE
-    byte record_length;
-    byte access_size;
-    word address;
-};]]>
-</screen>
-</sect2>
-
 <sect2 id="dg-manual.record-range" xreflabel="Range requests">
 <title>Range requests</title>
 <para>Client requests for range tracking are recorded as records as well. The
@@ -250,7 +234,7 @@ struct event
 </sect2>
 
 <sect2 id="dg-manual.record-bb" xreflabel="Basic blocks">
-<title>Basic block events</title>
+<title>Basic blocks</title>
 </sect2>
 <para>Basic blocks are first defined, then later run. A basic block is
 actually a superblock, so may cover discontiguous addresses and have internal
@@ -259,14 +243,9 @@ block, as instruction counts relative to the start of the block. The
 bbdef_entry fields correspond to IMark and data access tags in the VEX IR i.e.
 it will always start with an instruction entry.
 </para>
-<para>When a block is run, it will refer to a previous block definition by
-the start address. It then contains the addresses of the data accesses, in the
-same order as the data-access entries in the definition. Because a basic block
-can be exited early, there is an instruction count in the record, and only
-the data accesses for this many instructions will be reported.
-</para>
-<para>Basic block definitions are limited to 255 instructions and should not
-cross function boundaries, so they may be smaller than VEX basic blocks.</para>
+<para>Basic block definitions are limited to 255 instructions and accesses,
+and should not cross function boundaries, so they may be smaller than VEX basic
+blocks.</para>
 <screen><![CDATA[
 struct bbdef_instr
 {
@@ -289,19 +268,40 @@ struct bbdef
     HWord n_accesses;    // number of data accesses
     bbdef_instr instrs[n_instr];
     bbdef_access accesses[n_accesses];
-};
+};]]>
+</screen>
+<para>
+It is common to reach the same basic block with the same execution stack
+multiple times. Each such event is recorded as a context. It refers to the
+basic block definition by its position in the file, starting from zero.
+</para>
+<screen><![CDATA[
+struct context
+{
+    HWord bbdef_index;
+    byte n_stack;
+    HWord stack[n_stack];
+};]]>
+</screen>
+<para>When a block is run, it will refer to a previously defined context by
+index (its position in the file). It then contains the addresses of the data
+accesses, in the same order as the data-access entries in the definition.
+Because a basic block can be exited early, there is an instruction count in the
+record, and only the data accesses for this many instructions will be
+reported.
+</para>
 
+<screen><![CDATA[
 struct bbrun
 {
-    byte record_type;     // DG_R_BBRUN
+    byte record_type;     // DG_R_CONTEXT
     byte record_length;
-    HWord bbdef_index;    // index into sequence of bbdefs in the file
-    byte n_stack;
-    HWord stack[n_stack]; // call stack at start of block
+    HWord context_index;  // index into sequence of contexts in the file
     byte n_instrs;        // number of instructions executed before leaving
     HWord addrs[];        // length determined from record size
 };]]>
 </screen>
+
 </sect2>
 
 </sect1>

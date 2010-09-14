@@ -48,8 +48,12 @@
 #include "datagrind.h"
 #include "dg_record.h"
 
-#define STACK_DEPTH 8
+#define STACK_DEPTH 8 /* TODO: replace with --num-callers option instead */
 #define OUT_BUF_SIZE 4096
+
+/* Defined in the core, but missing from the header (which has the
+ * non-existent function apply_ExeContext instead). */
+extern StackTrace VG_(get_ExeContext_StackTrace) ( ExeContext* e );
 
 typedef enum
 {
@@ -94,25 +98,43 @@ typedef struct
 
 typedef struct
 {
+   VgHashNode header;
+   UWord context_index;
+} DgBBDefContext;
+
+typedef struct
+{
    ULong index;
+   /* Maps ExeContext pointers to context indices. */
+   VgHashTable context_indices;
+   Addr start_ip;
    XArray *instrs;
    XArray *accesses;
 } DgBBDef;
 
 typedef struct
 {
-   ULong bbdef_index;
-   UInt n_ips;
-   Addr ips[STACK_DEPTH];
+   ULong context_index;
    HWord n_instrs;
-   XArray *accesses; /* HWord */
+   XArray* accesses; /* HWord */
 } DgBBRun;
+
+/* A SB corresponds exactly to a call to dg_instrument. It may contain
+ * multiple DgBBDef entries if the IRSB was partitioned to meet size limits.
+ */
+typedef struct
+{
+   VgHashNode header; /* Key for hash table indexed by nraddr */
+   XArray* bbdefs;    /* Each element is a DgBBDef* */
+} DgSB;
 
 static Int out_fd = -1;
 static UChar out_buf[OUT_BUF_SIZE];
 static UInt out_buf_used = 0;
 static DgBBRun out_bbr;
-static ULong global_bbdef_index = 0;
+static UWord global_bbdef_index = 0;
+static UWord global_context_index = 0;
+static VgHashTable dgsbs = NULL;
 
 static VgHashTable debuginfo_table = NULL;
 static Bool debuginfo_dirty = True;
@@ -218,8 +240,8 @@ static void dg_post_clo_init(void)
 {
    debuginfo_table = VG_(HT_construct)("datagrind.debuginfo_table");
    block_table = VG_(HT_construct)("datagrind.block_table");
+   dgsbs = VG_(HT_construct)("datagrind.dgsbs");
    out_bbr.n_instrs = 0;
-   out_bbr.n_ips = 0;
    out_bbr.accesses = VG_(newXA)(VG_(malloc), "datagrind.out_bb.accesses",
                                  VG_(free), sizeof(HWord));
 
@@ -232,39 +254,56 @@ static void trace_bb_flush(DgBBRun *bbr)
    {
       UInt i;
       Word n_accesses = VG_(sizeXA)(bbr->accesses);
-      ULong length = 2 + (1 + bbr->n_ips + n_accesses) * sizeof(HWord);
-
-      tl_assert(bbr->n_ips > 0);
+      ULong length = 1 + (1 + n_accesses) * sizeof(HWord);
 
       out_byte(DG_R_BBRUN);
       out_length(length);
-      out_word(bbr->bbdef_index);
-      out_byte(bbr->n_ips);
-      for (i = 0; i < bbr->n_ips; i++)
-         out_word(bbr->ips[i]);
+      out_word(bbr->context_index);
       out_byte(bbr->n_instrs);
       for (i = 0; i < n_accesses; i++)
          out_word(*(HWord *) VG_(indexXA)(bbr->accesses, i));
 
       /* Reset for next */
       bbr->n_instrs = 0;
-      bbr->n_ips = 0;
       VG_(dropTailXA)(bbr->accesses, n_accesses);
    }
+   tl_assert(VG_(sizeXA)(bbr->accesses) == 0);
 }
 
-static VG_REGPARM(1) void trace_bb_start(Addr iaddr)
+static VG_REGPARM(1) void trace_bb_start(DgBBDef *bbd)
 {
    DgBBRun *bbr = &out_bbr;
    ThreadId tid = VG_(get_running_tid)();
-   HWord ip = VG_(get_IP)(tid);
+   Addr ip = VG_(get_IP)(tid);
+   ExeContext *ec;
+   DgBBDefContext *ctx;
 
+   /* Flush out the old one before clobbering it */
    trace_bb_flush(bbr);
-   bbr->n_ips = VG_(get_StackTrace)(tid, bbr->ips,
-                                    STACK_DEPTH, NULL, NULL,
-                                    iaddr - ip);
-   tl_assert(bbr->n_ips > 0);
-   tl_assert(iaddr == bbr->ips[0]);
+
+   ec = VG_(record_ExeContext)(tid, bbd->start_ip - ip);
+   ctx = VG_(HT_lookup)(bbd->context_indices, (UWord) ec);
+   if (ctx == NULL)
+   {
+      Int n_ips = VG_(get_ExeContext_n_ips)(ec);
+      StackTrace stack = VG_(get_ExeContext_StackTrace)(ec);
+      Int i;
+
+      if (n_ips > 255)
+         n_ips = 255;
+      out_byte(DG_R_CONTEXT);
+      out_length(1 + (1 + n_ips) * sizeof(HWord));
+      out_word(bbd->index);
+      out_byte((UChar) n_ips);
+      for (i = 0; i < n_ips; i++)
+         out_word(stack[i]);
+
+      ctx = VG_(calloc)("datagrind.trace_bb_start", 1, sizeof(DgBBDefContext));
+      ctx->header.key = (UWord) ec;
+      ctx->context_index = global_context_index++;
+      VG_(HT_add_node)(bbd->context_indices, ctx);
+   }
+   bbr->context_index = ctx->context_index;
 }
 
 static VG_REGPARM(1) void trace_access(Addr addr)
@@ -272,10 +311,9 @@ static VG_REGPARM(1) void trace_access(Addr addr)
    VG_(addToXA)(out_bbr.accesses, &addr);
 }
 
-static VG_REGPARM(2) void trace_update_instrs(HWord n_instrs, HWord bbdef_index)
+static VG_REGPARM(1) void trace_update_instrs(HWord n_instrs)
 {
    out_bbr.n_instrs = n_instrs;
-   out_bbr.bbdef_index = bbdef_index;
 }
 
 static void clean_debuginfo(void)
@@ -308,11 +346,13 @@ static void clean_debuginfo(void)
    }
 }
 
-static void dg_bbdef_init(DgBBDef *bbd)
+static DgBBDef* dg_bbdef_new(void)
 {
-   bbd->index = global_bbdef_index;
-   bbd->instrs = VG_(newXA)(VG_(malloc), "datagrind.instrs", VG_(free), sizeof(DgBBDefInstr));
-   bbd->accesses = VG_(newXA)(VG_(malloc), "datagrind.accesses", VG_(free), sizeof(DgBBDefAccess));
+   DgBBDef *bbd = VG_(malloc)("datagrind.bbdef", sizeof(DgBBDef));
+   bbd->instrs = VG_(newXA)(VG_(malloc), "datagrind.bbdef.instrs", VG_(free), sizeof(DgBBDefInstr));
+   bbd->accesses = VG_(newXA)(VG_(malloc), "datagrind.bbdef.accesses", VG_(free), sizeof(DgBBDefAccess));
+   bbd->context_indices = VG_(HT_construct)("datagrind.bbdef.context_indices");
+   return bbd;
 }
 
 static void dg_bbdef_flush(DgBBDef *bbd)
@@ -343,28 +383,31 @@ static void dg_bbdef_flush(DgBBDef *bbd)
       out_byte(access->size);
       out_byte(access->iseq);
    }
+   bbd->index = global_bbdef_index++;
 
-   /* Empty the arrays */
+   /* Empty the arrays - we no longer need them */
    VG_(dropTailXA)(bbd->instrs, n_instrs);
    VG_(dropTailXA)(bbd->accesses, n_accesses);
-
-   /* Prepare for the next one */
-   bbd->index++;
 }
 
-static void dg_bbdef_destroy(DgBBDef *bbd)
+static void dg_bbdef_delete(DgBBDef *bbd)
 {
    VG_(deleteXA)(bbd->instrs);
    VG_(deleteXA)(bbd->accesses);
-   global_bbdef_index = bbd->index;
+   VG_(HT_destruct)(bbd->context_indices);
+   VG_(free)(bbd);
 }
 
-static void dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size)
+/* Returns a new def if the old one had to be flushed */
+static DgBBDef* dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size)
 {
    DgBBDefInstr instr;
 
    if (VG_(sizeXA)(bbd->instrs) == 255)
+   {
       dg_bbdef_flush(bbd);
+      bbd = dg_bbdef_new();
+   }
 
    if (VG_(sizeXA)(bbd->instrs) == 0)
    {
@@ -372,7 +415,8 @@ static void dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size
       IRDirty* di;
       IRExpr** argv;
 
-      argv = mkIRExprVec_1(mkIRExpr_HWord(addr));
+      bbd->start_ip = addr;
+      argv = mkIRExprVec_1(mkIRExpr_HWord((HWord) bbd));
       /* TODO: does this need to marked as reading guest state and memory, for
        * stack unwinding?
        */
@@ -385,6 +429,7 @@ static void dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT size
    instr.addr = addr;
    instr.size = (UChar) size;
    VG_(addToXA)(bbd->instrs, &instr);
+   return bbd;
 }
 
 static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *addr, SizeT size)
@@ -410,19 +455,29 @@ static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *ad
 /* Adds IR to update the instruction count. Must be done before an exit
  * from a block.
  */
-static void dg_bbdef_update_instrs(IRSB *sbOut, DgBBDef *bbd)
+static void dg_bbdef_update_instrs(IRSB* sbOut, DgBBDef* bbd)
 {
    IRDirty* di;
    IRExpr** argv;
    SizeT n_instrs = VG_(sizeXA)(bbd->instrs);
 
-   if (n_instrs == 0)
-      return;
+   tl_assert(n_instrs > 0);
 
-   argv = mkIRExprVec_2(mkIRExpr_HWord(n_instrs), mkIRExpr_HWord(bbd->index));
-   di = unsafeIRDirty_0_N(2, (Char *) "trace_update_instrs",
+   argv = mkIRExprVec_1(mkIRExpr_HWord(n_instrs));
+   di = unsafeIRDirty_0_N(1, (Char *) "trace_update_instrs",
                           VG_(fnptr_to_fnentry)(&trace_update_instrs), argv);
    addStmtToIRSB(sbOut, IRStmt_Dirty(di));
+}
+
+static DgSB* dg_sb_new(UWord key)
+{
+   DgSB* dgsb;
+
+   dgsb = VG_(malloc)("datagrind.dg_sb_new", sizeof(DgSB));
+   dgsb->header.key = key;
+   dgsb->bbdefs = VG_(newXA)(VG_(malloc), "datagrind.dgsb", VG_(free), sizeof(DgSB*));
+   VG_(HT_add_node)(dgsbs, dgsb);
+   return dgsb;
 }
 
 static IRSB* dg_instrument(VgCallbackClosure* closure,
@@ -433,7 +488,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
 {
    IRSB* sbOut;
    Int i;
-   DgBBDef bbd;
+   DgBBDef *bbd;
+   DgSB *dgsb;
    Bool needs_flush = False;
 
    if (gWordTy != hWordTy)
@@ -452,7 +508,9 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
       addStmtToIRSB(sbOut, sbIn->stmts[i]);
    }
 
-   dg_bbdef_init(&bbd);
+   dgsb = dg_sb_new(closure->nraddr);
+   bbd = dg_bbdef_new();
+   VG_(addToXA)(dgsb->bbdefs, &bbd);
 
    for (; i < sbIn->stmts_used; i++)
    {
@@ -469,26 +527,37 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_Exit:
-            dg_bbdef_update_instrs(sbOut, &bbd);
+            dg_bbdef_update_instrs(sbOut, bbd);
             /* TODO: needed when crossing function boundaries */
             /* needs_flush = True; */
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_IMark:
-            if (needs_flush)
             {
-               dg_bbdef_flush(&bbd);
-               needs_flush = False;
+               DgBBDef *bbd_new;
+               if (needs_flush)
+               {
+                  dg_bbdef_flush(bbd);
+                  bbd = dg_bbdef_new();
+                  VG_(addToXA)(dgsb->bbdefs, &bbd);
+                  needs_flush = False;
+               }
+               addStmtToIRSB(sbOut, st);
+               bbd_new = dg_bbdef_add_instr(sbOut, bbd, st->Ist.IMark.addr, st->Ist.IMark.len);
+               if (bbd_new != bbd)
+               {
+                  /* It was flushed by add_instr */
+                  VG_(addToXA)(dgsb->bbdefs, &bbd_new);
+                  bbd = bbd_new;
+               }
             }
-            addStmtToIRSB(sbOut, st);
-            dg_bbdef_add_instr(sbOut, &bbd, st->Ist.IMark.addr, st->Ist.IMark.len);
             break;
          case Ist_WrTmp:
             {
                IRExpr* data = st->Ist.WrTmp.data;
                if (data->tag == Iex_Load)
                {
-                  dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ,
+                  dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ,
                                       data->Iex.Load.addr,
                                       sizeofIRType(data->Iex.Load.ty));
                }
@@ -498,7 +567,7 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_Store:
             {
                IRExpr* data = st->Ist.Store.data;
-               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE,
+               dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE,
                                     st->Ist.Store.addr,
                                     sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)));
             }
@@ -512,10 +581,10 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                   tl_assert(d->mAddr != NULL);
                   tl_assert(d->mSize != 0);
                   if (d->mFx == Ifx_Read || d->mFx == Ifx_Modify)
-                     dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ,
+                     dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ,
                                           d->mAddr, d->mSize);
                   if (d->mFx == Ifx_Write || d->mFx == Ifx_Modify)
-                     dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE,
+                     dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE,
                                           d->mAddr, d->mSize);
                }
             }
@@ -530,8 +599,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                dataSize = sizeofIRType(typeOfIRExpr(sbOut->tyenv, cas->dataLo));
                if (cas->dataHi != NULL)
                   dataSize *= 2;
-               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_READ, cas->addr, dataSize);
-               dg_bbdef_add_access(sbOut, &bbd, DG_ACC_WRITE, cas->addr, dataSize);
+               dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ, cas->addr, dataSize);
+               dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE, cas->addr, dataSize);
             }
             addStmtToIRSB(sbOut, st);
             break;
@@ -540,11 +609,28 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
       }
    }
 
-   dg_bbdef_update_instrs(sbOut, &bbd);
-   dg_bbdef_flush(&bbd);
-   dg_bbdef_destroy(&bbd);
-
+   dg_bbdef_update_instrs(sbOut, bbd);
+   dg_bbdef_flush(bbd);
    return sbOut;
+}
+
+static void dg_discard_superblock_info(Addr64 orig_addr64, VexGuestExtents vge)
+{
+   Addr orig_addr = (Addr)orig_addr64;
+   DgSB *sb = VG_(HT_remove)(dgsbs, (UWord) orig_addr);
+
+   if (sb != NULL)
+   {
+      Word size = VG_(sizeXA)(sb->bbdefs);
+      Word i;
+      for (i = 0; i < size; i++)
+      {
+         DgBBDef** item = (DgBBDef**) VG_(indexXA)(sb->bbdefs, i);
+         dg_bbdef_delete(*item);
+      }
+      VG_(deleteXA)(sb->bbdefs);
+      VG_(free)(sb);
+   }
 }
 
 static void out_add_block(DgMallocBlock* block)
@@ -808,6 +894,7 @@ static void dg_pre_clo_init(void)
       dg_malloc_usable_size,
       0                  /* red zone */
       );
+   VG_(needs_superblock_discards)(dg_discard_superblock_info);
 
    VG_(track_new_mem_startup)(dg_track_new_mem_mmap_or_startup);
    VG_(track_new_mem_mmap)(dg_track_new_mem_mmap_or_startup);
