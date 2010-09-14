@@ -73,21 +73,8 @@ struct mem_access
 
 struct context
 {
-    uint64_t bbdef_index;
+    HWord bbdef_index;
     vector<HWord> stack;
-
-    bool operator<(const context &b) const
-    {
-        if (bbdef_index != b.bbdef_index)
-            return bbdef_index < b.bbdef_index;
-        else
-            return stack < b.stack;
-    }
-
-    bool operator==(const context &b) const
-    {
-        return bbdef_index == b.bbdef_index && stack == b.stack;
-    }
 };
 
 struct bbdef_access
@@ -107,8 +94,8 @@ struct bbrun
 {
     uint64_t iseq_start;
     uint64_t dseq_start;
-    set<context>::const_iterator ctx;
-    size_t n_addrs;
+    uint32_t context_index;
+    uint32_t n_addrs;
     HWord *addrs;                 /* Allocated from hword_pool; NULL means discarded */
     mem_block **blocks;           /* Allocated from mem_block_ptr_pool */
 };
@@ -151,9 +138,9 @@ static set<string> chosen_events;
 /* Ranges selected on the command line, or empty if there wasn't a choice */
 static set<string> chosen_ranges;
 
-static set<context> contexts;
 static vector<bbdef> bbdefs;
 static vector<bbrun> bbruns;
+static vector<context> contexts;
 static map<HWord, size_t> page_map;
 static map<size_t, HWord> rev_page_map;
 
@@ -175,7 +162,8 @@ static pair<double, size_t> nearest_access_bbrun(const bbrun &bbr, double addr, 
     double best_score = HUGE_VAL;
     size_t best_i = 0;
 
-    const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
+    const context &ctx = contexts[bbr.context_index];
+    const bbdef &bbd = bbdefs[ctx.bbdef_index];
     for (size_t i = 0; i < bbr.n_addrs; i++)
         if (bbr.addrs[i])
         {
@@ -243,7 +231,8 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
 
     if (best != bbruns.end())
     {
-        const bbdef &bbd = bbdefs[best->ctx->bbdef_index];
+        const context &ctx = contexts[best->context_index];
+        const bbdef &bbd = bbdefs[ctx.bbdef_index];
         assert(best_i < bbd.accesses.size());
         const bbdef_access &bbda = bbd.accesses[best_i];
         ans.addr = best->addrs[best_i];
@@ -253,7 +242,7 @@ static mem_access nearest_access(double addr, double iseq, double ratio)
 
         assert(bbda.iseq < bbd.instr_addrs.size());
         ans.iseq = best->iseq_start + bbda.iseq;
-        ans.stack = best->ctx->stack;
+        ans.stack = ctx.stack;
         if (ans.stack.empty())
             ans.stack.resize(1);
         ans.stack[0] = bbd.instr_addrs[bbda.iseq];
@@ -382,21 +371,10 @@ static void load(const char *filename)
                         bbdefs.push_back(bbd);
                     }
                     break;
-                case DG_R_BBRUN:
+                case DG_R_CONTEXT:
                     {
-                        bbrun bbr;
-                        bool keep_any = false;
                         context ctx;
-
-                        bbr.iseq_start = iseq;
-                        bbr.dseq_start = dseq;
                         ctx.bbdef_index = rp->extract_word();
-                        if (ctx.bbdef_index >= bbdefs.size())
-                        {
-                            ostringstream msg;
-                            msg << "Error: bbdef index " << ctx.bbdef_index << " is out of range";
-                            throw record_parser_content_error(msg.str());
-                        }
 
                         uint8_t n_stack = rp->extract_byte();
                         if (n_stack == 0)
@@ -405,6 +383,31 @@ static void load(const char *filename)
                         for (uint8_t i = 0; i < n_stack; i++)
                             ctx.stack[i] = rp->extract_word();
 
+                        if (ctx.bbdef_index >= bbdefs.size())
+                        {
+                            ostringstream msg;
+                            msg << "Error: bbdef index " << ctx.bbdef_index << " is out of range";
+                            throw record_parser_content_error(msg.str());
+                        }
+                        contexts.push_back(ctx);
+                    }
+                    break;
+                case DG_R_BBRUN:
+                    {
+                        bbrun bbr;
+                        bool keep_any = false;
+
+                        bbr.iseq_start = iseq;
+                        bbr.dseq_start = dseq;
+                        bbr.context_index = rp->extract_word();
+                        if (bbr.context_index >= contexts.size())
+                        {
+                            ostringstream msg;
+                            msg << "Error: context index " << bbr.context_index << " is out of range";
+                            throw record_parser_content_error(msg.str());
+                        }
+
+                        const context &ctx = contexts[bbr.context_index];
                         const bbdef &bbd = bbdefs[ctx.bbdef_index];
                         uint8_t n_instrs = rp->extract_byte();
                         uint64_t n_addrs = rp->remain() / sizeof(HWord);
@@ -435,10 +438,7 @@ static void load(const char *filename)
                         }
 
                         if (keep_any)
-                        {
-                            bbr.ctx = contexts.insert(ctx).first;
                             bbruns.push_back(bbr);
-                        }
                         iseq += n_instrs;
                         dseq += n_addrs;
                     }
@@ -600,7 +600,8 @@ static size_t count_access_bytes(void)
         for (size_t j = 0; j < bbr.n_addrs; j++)
             if (bbr.addrs[j])
             {
-                const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
+                const context &ctx = contexts[bbr.context_index];
+                const bbdef &bbd = bbdefs[ctx.bbdef_index];
                 assert(j < bbd.accesses.size());
                 const bbdef_access &bbda = bbd.accesses[j];
                 total += bbda.size;
@@ -629,7 +630,8 @@ static void init_gl(void)
         for (size_t j = 0; j < bbr.n_addrs; j++)
             if (bbr.addrs[j])
             {
-                const bbdef &bbd = bbdefs[bbr.ctx->bbdef_index];
+                const context &ctx = contexts[bbr.context_index];
+                const bbdef &bbd = bbdefs[ctx.bbdef_index];
                 assert(j < bbd.accesses.size());
                 const bbdef_access &bbda = bbd.accesses[j];
                 for (int k = 0; k < bbda.size; k++)
