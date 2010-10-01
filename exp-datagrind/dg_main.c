@@ -334,9 +334,8 @@ static void clean_debuginfo(void)
             node->header.key = (UWord) di;
             VG_(HT_add_node)(debuginfo_table, node);
 
-            if (filename_len > 128) filename_len = 128;
             out_byte(DG_R_TEXT_AVMA);
-            out_byte(filename_len + sizeof(Addr) + 1);
+            out_length(filename_len + sizeof(Addr) + 1);
             out_word(text_avma);
             out_bytes(filename, filename_len);
             out_byte('\0');
