@@ -6,14 +6,14 @@
 <chapter id="dg-manual" xreflabel="Datagrind: a data access logger">
 <title>Datagrind: a data accessor logger</title>
 
-<para>To use this tool, you must specify <option>--tool=datagrind</option> on
+<para>To use this tool, you must specify <option>--tool=ext-datagrind</option> on
 the Valgrind command line.</para>
 
 <sect1 id="dg-manual.overview" xreflabel="Overview">
 <title>Overview</title>
 
 <para>Datagrind captures all read and write accesses made by a program and
-records them in a log file. A separate tool (dg_view), can
+records them in a log file. A separate tool (<command>dg_view</command>), can
 then be used to visually represent the reads and write.</para>
 
 </sect1>
@@ -21,18 +21,21 @@ then be used to visually represent the reads and write.</para>
 <sect1 id="dg-manual.using" xreflabel="Using Datagrind and dg_view">
 <title>Using Datagrind and dg_view</title>
 
-<para>At present, Datagrind does not make any use of the debugging information
-from the executable (the <option>-g</option> compiler option). If you are
+<para>Datagrind does not directly make use of debugging information from the
+executable, but dg_view uses it to map addresses back to functions and line
+numbers. Compiling with <option>-g</option> is thus recommended. If you are
 tuning your program, you should compile with optimisation, as this will show
 how your program will really access memory. If you are trying to understand
 your program, it may be more useful to disable optimization so that memory
-accesses will be done in the same way they appear in source code.</para>
+accesses will be done in the same way they appear in source code. It will also
+improve the usefulness of stack traces, as some optimisations (such as
+inlining) can affect stack traces</para>
 
 <para>Once you've built your program, you need to run Datagrind to gather the
 log of memory accesses. Since every memory access is recorded, this file can
 get big extremely quickly, and so you should not try to capture more than a
 second or two of execution (even if you have the storage for a bigger capture,
-dg_view does not currently cope well with very large files).</para>
+dg_view may struggle to display it.</para>
 
 <para>Once you've captured a log, you can then use dg_view to examine it
 visually.</para>
@@ -41,10 +44,10 @@ visually.</para>
 <title>Running Datagrind</title>
 
 <para>To run Datagrind on a program <filename>prog</filename>, run:</para>
-<screen>valgrind --tool=datagrind prog</screen>
+<screen>valgrind --tool=exp-datagrind prog</screen>
 
-<para>The program will execute. Datagrind does not output any diagnostic
-messages. By default, the output log will be written to
+<para>The program will execute. Datagrind does not normally output any
+diagnostic messages. By default, the output log will be written to
 <filename>datagrind.out.<replaceable>pid</replaceable></filename>, but this
 can be changed by passing the option
 <option>--datagrind-out-file=<replaceable>filename.out</replaceable></option>
@@ -55,19 +58,17 @@ to Valgrind.</para>
 <sect2 id="dg-manual.running-dg_view" xreflabel="Running dg_view">
 <title>Running dg_view</title>
 
-<para>dg_view is a quick-and-dirty viewer for the output of Datagrind. It
-relies on OpenGL 1.5 or later, GLUT, and GLEW. It also relies on using video
-memory to store the data, so it can fail if you try to view too big a log
-file.</para>
+<para>dg_view is a viewer for the output of datagrind, distributed and built
+separately. It uses GTK+ for display.</para>
 
 <para>To use dg_view, simply run</para>
 <screen>dg_view <replaceable>datagrind.out.pid</replaceable></screen>
 
 <para>
-This will open a window showing the data accesses. Green and blue dots show
-read and write accesses respectively; turquoise shows pixels where both reads
+This will open a window showing the data accesses. Green and red dots show
+read and write accesses respectively; yellows shows pixels where both reads
 and writes occur. The X axis shows address, while the Y axis shows the
-accesses in sequence.
+instruction count.
 </para>
 
 <para>
@@ -83,9 +84,16 @@ level is sufficient to avoid them overlapping.
 <para>
 In the initial view, all events and all accessed events are shown, which gives
 a good overview but makes fine details difficult to see. You can click and
-drag a rectangle (using the left mouse button) to zoom in on it. At present
-there is no way to zoom out again other than restarting dg_view.
+drag a rectangle (using the left mouse button) to zoom in on it. The toolbar
+icons can also be used to zoom in or out in either dimension.
 </para>
+
+<sect3 id="dg-manual.running-dg_view.options" xreflabel="Command-line options">
+<title>Command-line options</title>
+<para>
+TODO
+</para>
+</sect3>
 
 </sect2>
 
@@ -116,8 +124,8 @@ events, using <symbol>DATAGRIND_START_EVENT</symbol> and
 
 <para>This information is simply recorded to the output file. When you run
 dg_view, you can use the options
-<option>--events=<replaceable>event1[,event2,...]</replaceable></option> and/or
-<option>--ranges=<replaceable>range1[,range2,...]</replaceable></option> to
+<option>--events=user:<replaceable>event1[,event2,...]</replaceable></option> and/or
+<option>--ranges=user:<replaceable>range1[,range2,...]</replaceable></option> to
 limit the display to memory accesses that fall within these ranges and
 events.</para>
 
@@ -149,12 +157,11 @@ word size to the host.
 <para>
 Each record begins with a byte identifying the record type. For record types
 0-127, the second byte is a length field, indicating the length of the rest of
-the record (excluding the initial two bytes). A length of 255 is reserved for
-future expansion; a reader encountering a value of 255 should abort, as it
-will not be able to determine the record size. For record types 128-255, the
-record type is followed by a single byte of payload, giving a two-byte record.
-The numeric values of the record types can be found in
-<filename>dg_record.h</filename>.
+the record (excluding the initial two bytes). A length of 255 is special: it
+indicates that the actual length is encoded in the following 64 bits. For
+record types 128-255, the record type is followed by a single byte of payload,
+giving a two-byte record.  The numeric values of the record types can be found
+in <filename>dg_record.h</filename>.
 </para>
 
 <para>
@@ -165,7 +172,9 @@ on the C code that defines the string, but UTF-8 is recommended.
 <para>
 Records are described with a C-like notation, but these structures will not
 actually be usable for accessing the file, because the file does not contain
-any padding between fields (thus, many fields are not aligned).
+any padding between fields (thus, many fields are not aligned). The
+variable-length encoding of the record length (described above) is denoted by
+a <symbol>length</symbol> type.
 </para>
 
 </sect2>
@@ -176,14 +185,19 @@ any padding between fields (thus, many fields are not aligned).
 The first record in the file is a header record. This is the only place the
 header record may appear. The signature identifies the general structure of
 the file, and readers that recognise this signature can be confident of
-parsing the file, with the exception of values that are specifically reserved
-(such as a record length of 255), and unknown record types.
+parsing the file, with the exception of values that are specifically reserved,
+and unknown record types.
+</para>
+<para>
+The header will never use the extended form of the length field, because it
+cannot be correctly interpreted until the file endianness is known, and the
+endianness is itself encoded in the header.
 </para>
 <screen><![CDATA[
 struct header
 {
     byte record_type;   // DG_R_HEADER
-    byte record_length;
+    length record_length;
     char signature[11] = "DATAGRIND1\0";
     byte version;
     byte endian;        // 0 for little-endian, 1 for big-endian
@@ -194,14 +208,12 @@ struct header
 
 <sect2 id="dg-manual.record-range" xreflabel="Range requests">
 <title>Range requests</title>
-<para>Client requests for range tracking are recorded as records as well. The
-strings passed by the client will be truncated to ensure that the record is
-strictly less than 255 bytes long.</para>
+<para>Client requests for range tracking are recorded as records as well.</para>
 <screen><![CDATA[
 struct track_range
 {
     byte record_type;   // DG_R_TRACK_RANGE
-    byte record_length;
+    length record_length;
     word address;
     word length;
     string type_name;
@@ -211,7 +223,7 @@ struct track_range
 struct untrack_range
 {
     byte record_type;   // DG_R_UNTRACK_RANGE
-    byte record_length;
+    length record_length;
     word address;
     word length;
 };]]>
@@ -227,7 +239,7 @@ The label is truncated to ensure that the record is less than 255 bytes long.
 struct event
 {
     byte record_type;   // DG_R_START_EVENT or DG_R_END_EVENT
-    byte record_length;
+    length record_length;
     string label;
 };]]>
 </screen>
@@ -240,8 +252,7 @@ struct event
 actually a superblock, so may cover discontiguous addresses and have internal
 exits. The block definition describes the read and write accesses in the
 block, as instruction counts relative to the start of the block. The
-bbdef_entry fields correspond to IMark and data access tags in the VEX IR i.e.
-it will always start with an instruction entry.
+bbdef_entry fields correspond to IMark and data access tags in the VEX IR.
 </para>
 <para>Basic block definitions are limited to 255 instructions and accesses,
 and should not cross function boundaries, so they may be smaller than VEX basic
@@ -249,7 +260,7 @@ blocks.</para>
 <screen><![CDATA[
 struct bbdef_instr
 {
-    HWord addr;
+    word addr;
     byte size;
 };
 
@@ -263,9 +274,9 @@ struct bbdef_access
 struct bbdef
 {
     byte record_type;    // DG_R_BBDEF
-    byte record_length;
+    length record_length;
     byte n_instrs;       // number of instructions
-    HWord n_accesses;    // number of data accesses
+    word n_accesses;     // number of data accesses
     bbdef_instr instrs[n_instr];
     bbdef_access accesses[n_accesses];
 };]]>
@@ -278,9 +289,9 @@ basic block definition by its position in the file, starting from zero.
 <screen><![CDATA[
 struct context
 {
-    HWord bbdef_index;
+    word bbdef_index;
     byte n_stack;
-    HWord stack[n_stack];
+    word stack[n_stack];
 };]]>
 </screen>
 <para>When a block is run, it will refer to a previously defined context by
@@ -295,10 +306,10 @@ reported.
 struct bbrun
 {
     byte record_type;     // DG_R_CONTEXT
-    byte record_length;
-    HWord context_index;  // index into sequence of contexts in the file
+    length record_length;
+    word context_index;   // index into sequence of contexts in the file
     byte n_instrs;        // number of instructions executed before leaving
-    HWord addrs[];        // length determined from record size
+    word addrs[];         // length determined from record size
 };]]>
 </screen>
 
