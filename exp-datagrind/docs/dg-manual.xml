@@ -247,7 +247,6 @@ struct event
 
 <sect2 id="dg-manual.record-bb" xreflabel="Basic blocks">
 <title>Basic blocks</title>
-</sect2>
 <para>Basic blocks are first defined, then later run. A basic block is
 actually a superblock, so may cover discontiguous addresses and have internal
 exits. The block definition describes the read and write accesses in the
