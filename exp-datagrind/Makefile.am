@@ -8,21 +8,7 @@ EXTRA_DIST = docs/dg-manual.xml
 
 pkginclude_HEADERS = datagrind.h
 
-noinst_HEADERS = dg_record.h dg_view_range.h dg_view_debuginfo.h \
-                 dg_view_parse.h dg_view_pool.h dg_view.h
-
-#----------------------------------------------------------------------------
-# dg_view
-#----------------------------------------------------------------------------
-
-bin_PROGRAMS = dg_view
-
-dg_view_SOURCES = dg_view.cpp dg_view_debuginfo.cpp dg_view_parse.cpp
-dg_view_CPPFLAGS = $(AM_CPPFLAGS_PRI)
-dg_view_CFLAGS = $(AM_CFLAGS_PRI)
-dg_view_CCASFLAGS = $(AM_CCASFLAGS_PRI)
-dg_view_LDFLAGS = $(AM_LDFLAGS_PRI)
-dg_view_LDADD = -lglut -lGLEW -lGL -lbfd
+noinst_HEADERS = dg_record.h
 
 #----------------------------------------------------------------------------
 # exp-datagrind-<platform>
