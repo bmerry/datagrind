@@ -6,7 +6,7 @@
 <chapter id="dg-manual" xreflabel="Datagrind: a data access logger">
 <title>Datagrind: a data accessor logger</title>
 
-<para>To use this tool, you must specify <option>--tool=ext-datagrind</option> on
+<para>To use this tool, you must specify <option>--tool=exp-datagrind</option> on
 the Valgrind command line.</para>
 
 <sect1 id="dg-manual.overview" xreflabel="Overview">
@@ -27,15 +27,15 @@ numbers. Compiling with <option>-g</option> is thus recommended. If you are
 tuning your program, you should compile with optimisation, as this will show
 how your program will really access memory. If you are trying to understand
 your program, it may be more useful to disable optimization so that memory
-accesses will be done in the same way they appear in source code. It will also
-improve the usefulness of stack traces, as some optimisations (such as
-inlining) can affect stack traces</para>
+accesses will be done in the same way they appear in source code. Some
+optimisations (such as inlining) will also make stack traces less
+accurate.</para>
 
 <para>Once you've built your program, you need to run Datagrind to gather the
 log of memory accesses. Since every memory access is recorded, this file can
 get big extremely quickly, and so you should not try to capture more than a
 second or two of execution (even if you have the storage for a bigger capture,
-dg_view may struggle to display it.</para>
+dg_view may struggle to display it).</para>
 
 <para>Once you've captured a log, you can then use dg_view to examine it
 visually.</para>
@@ -91,8 +91,68 @@ icons can also be used to zoom in or out in either dimension.
 <sect3 id="dg-manual.running-dg_view.options" xreflabel="Command-line options">
 <title>Command-line options</title>
 <para>
-TODO
+To make it easier to focus on specific information, dg_view allows the
+accesses to be filtered in two ways: by the accessing instruction, and by the
+memory allocation to which the source or target data belongs. These are
+controlled by the <option>--events</option> and <option>--ranges</option>
+options respectively. They each take a comma-separated list of conditions. An
+access is considered to match if the it matches at least one of the event
+conditions and at least one of the range conditions. The valid conditions are
+listed below. Where a reference is made to <quote>the call stack</quote>, it
+is the call stack at which the access occurred, for <option>--events</option>,
+or the call stack at which the memory was allocated, for
+<option>--ranges</option>. At present, only heap allocations are tracked; if
+<option>--ranges</option> is specified at all, no accesses to the stack or to
+global variables will be displayed.
 </para>
+<variablelist>
+<varlistentry>
+<term><option>fn:<replaceable>function</replaceable></option></term>
+<listitem><para>
+Matches if <replaceable>function</replaceable> is in the call stack.
+</para></listitem>
+</varlistentry>
+<varlistentry>
+<term><option>file:<replaceable>file</replaceable></option></term>
+<listitem><para>
+Matches if a function in the call stack comes from
+<replaceable>file</replaceable>. This depends on the necessary debug
+information being stored in the binaries.
+</para></listitem>
+</varlistentry>
+<varlistentry>
+<term><option>dso:<replaceable>dso</replaceable></option></term>
+<listitem><para>
+Matches if a function in the call stack comes from
+the executable or shared library <replaceable>dso</replaceable>.
+</para></listitem>
+</varlistentry>
+<varlistentry>
+<term><option>user:<replaceable>string</replaceable></option></term>
+<listitem><para>
+Matches based on client requests issued by the guest program. Refer to <xref
+linkend="dg-manual.requests"/> for more information about client requests.
+</para></listitem>
+</varlistentry>
+<varlistentry>
+<term><option>range</option></term>
+<listitem><para>
+Matches any allocation reported by a <symbol>DATAGRIND_TRACK_RANGE</symbol>
+clent request. Refer to <xref linkend="dg-manual.requests"/> for more
+information about client requests. This option is only accepted by
+<option>--ranges</option>, not <option>--events</option>.
+</para></listitem>
+</varlistentry>
+<varlistentry>
+<term><option>malloc</option></term>
+<listitem><para>
+Matches any access to memory allocated with a <function>malloc</function>-like
+function.
+This option is only accepted by <option>--ranges</option>, not
+<option>--events</option>.
+</para></listitem>
+</varlistentry>
+</variablelist>
 </sect3>
 
 </sect2>
@@ -124,8 +184,8 @@ events, using <symbol>DATAGRIND_START_EVENT</symbol> and
 
 <para>This information is simply recorded to the output file. When you run
 dg_view, you can use the options
-<option>--events=user:<replaceable>event1[,event2,...]</replaceable></option> and/or
-<option>--ranges=user:<replaceable>range1[,range2,...]</replaceable></option> to
+<option>--events=user:<replaceable>event</replaceable></option> and/or
+<option>--ranges=user:<replaceable>range</replaceable></option> to
 limit the display to memory accesses that fall within these ranges and
 events.</para>
 
@@ -150,8 +210,8 @@ information to determine the endianness, although dg_view currently does not
 support viewing a file with a different endianness to the host on which it is
 running. Similarly, all addresses and many sizes are stored using the word
 (pointer) size of the target machine, with sufficient header information to
-determine this. Again, dg_view does not yet support files with a different
-word size to the host.
+determine this. dg_view currently supports viewing files with either 32-bit or
+64-bit words, regardless of the word size of the machine on which it is run.
 </para>
 
 <para>
