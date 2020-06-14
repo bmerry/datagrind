@@ -431,7 +431,8 @@ static DgBBDef* dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT 
    return bbd;
 }
 
-static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *addr, SizeT size)
+static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *addr, SizeT size,
+                                IRExpr *guard)
 {
    SizeT n_instrs = VG_(sizeXA)(bbd->instrs);
    DgBBDefAccess access;
@@ -448,6 +449,8 @@ static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *ad
    argv = mkIRExprVec_1(addr);
    di = unsafeIRDirty_0_N(1, "trace_access",
                           VG_(fnptr_to_fnentry)(&trace_access), argv);
+   if (guard)
+       di->guard = guard;
    addStmtToIRSB(sbOut, IRStmt_Dirty(di));
 }
 
@@ -524,8 +527,6 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_Put:
          case Ist_PutI:
          case Ist_MBE:
-         case Ist_LoadG:  /* TODO: implement */
-         case Ist_StoreG: /* TODO: implement */
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_Exit:
@@ -561,7 +562,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                {
                   dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ,
                                       data->Iex.Load.addr,
-                                      sizeofIRType(data->Iex.Load.ty));
+                                      sizeofIRType(data->Iex.Load.ty),
+                                      NULL);
                }
             }
             addStmtToIRSB(sbOut, st);
@@ -570,8 +572,9 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
             {
                IRExpr* data = st->Ist.Store.data;
                dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE,
-                                    st->Ist.Store.addr,
-                                    sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)));
+                                   st->Ist.Store.addr,
+                                   sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)),
+                                   NULL);
             }
             addStmtToIRSB(sbOut, st);
             break;
@@ -584,10 +587,10 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                   tl_assert(d->mSize != 0);
                   if (d->mFx == Ifx_Read || d->mFx == Ifx_Modify)
                      dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ,
-                                          d->mAddr, d->mSize);
+                                          d->mAddr, d->mSize, NULL);
                   if (d->mFx == Ifx_Write || d->mFx == Ifx_Modify)
                      dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE,
-                                          d->mAddr, d->mSize);
+                                          d->mAddr, d->mSize, NULL);
                }
             }
             addStmtToIRSB(sbOut, st);
@@ -601,8 +604,30 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
                dataSize = sizeofIRType(typeOfIRExpr(sbOut->tyenv, cas->dataLo));
                if (cas->dataHi != NULL)
                   dataSize *= 2;
-               dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ, cas->addr, dataSize);
-               dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE, cas->addr, dataSize);
+               dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ, cas->addr, dataSize, NULL);
+               dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE, cas->addr, dataSize, NULL);
+            }
+            addStmtToIRSB(sbOut, st);
+            break;
+         case Ist_StoreG:
+            {
+                IRStoreG* sg = st->Ist.StoreG.details;
+                IRExpr* data = sg->data;
+                dg_bbdef_add_access(sbOut, bbd, DG_ACC_WRITE, sg->addr,
+                                    sizeofIRType(typeOfIRExpr(sbOut->tyenv, data)),
+                                    sg->guard);
+            }
+            addStmtToIRSB(sbOut, st);
+            break;
+         case Ist_LoadG:
+            {
+                IRLoadG* lg = st->Ist.LoadG.details;
+                IRType type = Ity_INVALID; /* loaded type */
+                IRType typeWide = Ity_INVALID; /* after implicit widening */
+                typeOfIRLoadGOp(lg->cvt, &typeWide, &type);
+                tl_assert(type != Ity_INVALID);
+                dg_bbdef_add_access(sbOut, bbd, DG_ACC_READ, lg->addr,
+                                    sizeofIRType(type), lg->guard);
             }
             addStmtToIRSB(sbOut, st);
             break;
