@@ -106,7 +106,7 @@ typedef struct
 {
    ULong index;
    /* Maps ExeContext pointers to context indices. */
-   VgHashTable context_indices;
+   VgHashTable *context_indices;
    Addr start_ip;
    XArray *instrs;
    XArray *accesses;
@@ -134,16 +134,16 @@ static UInt out_buf_used = 0;
 static DgBBRun out_bbr;
 static UWord global_bbdef_index = 0;
 static UWord global_context_index = 0;
-static VgHashTable dgsbs = NULL;
+static VgHashTable *dgsbs = NULL;
 
-static VgHashTable debuginfo_table = NULL;
+static VgHashTable *debuginfo_table = NULL;
 static Bool debuginfo_dirty = True;
 
-static VgHashTable block_table = NULL;
+static VgHashTable *block_table = NULL;
 
-static Char *clo_datagrind_out_file = "datagrind.out.%p";
+static const HChar *clo_datagrind_out_file = "datagrind.out.%p";
 
-static Bool dg_process_cmd_line_option(Char *arg)
+static Bool dg_process_cmd_line_option(const HChar *arg)
 {
    if (VG_STR_CLO(arg, "--datagrind-out-file", clo_datagrind_out_file)) {}
    else if (VG_(replacement_malloc_process_cmd_line_option)(arg)) {}
@@ -206,7 +206,7 @@ static void out_length(ULong len)
 static void prepare_out_file(void)
 {
    SysRes sres;
-   Char *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
+   HChar *filename = VG_(expand_file_name)("--datagrind-out-file", clo_datagrind_out_file);
    sres = VG_(open)(filename, VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY,
                     VKI_S_IRUSR | VKI_S_IWUSR);
    if (sr_isError(sres))
@@ -324,7 +324,7 @@ static void clean_debuginfo(void)
 
       for (; di != NULL; di = VG_(next_DebugInfo)(di))
       {
-         const UChar *filename = VG_(DebugInfo_get_filename)(di);
+         const HChar *filename = VG_(DebugInfo_get_filename)(di);
          Addr text_avma = VG_(DebugInfo_get_text_avma)(di);
          SizeT filename_len = VG_(strlen)(filename);
 
@@ -393,7 +393,7 @@ static void dg_bbdef_delete(DgBBDef *bbd)
 {
    VG_(deleteXA)(bbd->instrs);
    VG_(deleteXA)(bbd->accesses);
-   VG_(HT_destruct)(bbd->context_indices);
+   VG_(HT_destruct)(bbd->context_indices, VG_(free));
    VG_(free)(bbd);
 }
 
@@ -419,7 +419,7 @@ static DgBBDef* dg_bbdef_add_instr(IRSB *sbOut, DgBBDef *bbd, HWord addr, SizeT 
       /* TODO: does this need to marked as reading guest state and memory, for
        * stack unwinding?
        */
-      di = unsafeIRDirty_0_N(1, (Char *) "trace_bb_start",
+      di = unsafeIRDirty_0_N(1, "trace_bb_start",
                              VG_(fnptr_to_fnentry)(&trace_bb_start), argv);
       addStmtToIRSB(sbOut, IRStmt_Dirty(di));
    }
@@ -446,7 +446,7 @@ static void dg_bbdef_add_access(IRSB *sbOut, DgBBDef *bbd, UChar dir, IRExpr *ad
    VG_(addToXA)(bbd->accesses, &access);
 
    argv = mkIRExprVec_1(addr);
-   di = unsafeIRDirty_0_N(1, (Char *) "trace_access",
+   di = unsafeIRDirty_0_N(1, "trace_access",
                           VG_(fnptr_to_fnentry)(&trace_access), argv);
    addStmtToIRSB(sbOut, IRStmt_Dirty(di));
 }
@@ -463,7 +463,7 @@ static void dg_bbdef_update_instrs(IRSB* sbOut, DgBBDef* bbd)
    tl_assert(n_instrs > 0);
 
    argv = mkIRExprVec_1(mkIRExpr_HWord(n_instrs));
-   di = unsafeIRDirty_0_N(1, (Char *) "trace_update_instrs",
+   di = unsafeIRDirty_0_N(1, "trace_update_instrs",
                           VG_(fnptr_to_fnentry)(&trace_update_instrs), argv);
    addStmtToIRSB(sbOut, IRStmt_Dirty(di));
 }
@@ -481,8 +481,9 @@ static DgSB* dg_sb_new(UWord key)
 
 static IRSB* dg_instrument(VgCallbackClosure* closure,
                            IRSB* sbIn,
-                           VexGuestLayout* layout,
-                           VexGuestExtents* vge,
+                           const VexGuestLayout* layout,
+                           const VexGuestExtents* vge,
+                           const VexArchInfo* rachinfo_host,
                            IRType gWordTy, IRType hWordTy)
 {
    IRSB* sbOut;
@@ -613,9 +614,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
    return sbOut;
 }
 
-static void dg_discard_superblock_info(Addr64 orig_addr64, VexGuestExtents vge)
+static void dg_discard_superblock_info(Addr orig_addr, VexGuestExtents vge)
 {
-   Addr orig_addr = (Addr)orig_addr64;
    DgSB *sb = VG_(HT_remove)(dgsbs, (UWord) orig_addr);
 
    if (sb != NULL)
@@ -660,7 +660,7 @@ static void add_block(ThreadId tid, void* p, SizeT szB, Bool custom)
    block->header.key = (UWord) p;
    block->szB = szB;
    if (!custom)
-      block->actual_szB = VG_(malloc_usable_size)(p);
+      block->actual_szB = VG_(cli_malloc_usable_size)(p);
    else
       block->actual_szB = szB;
 
@@ -755,7 +755,7 @@ static void* dg_realloc(ThreadId tid, void* p, SizeT szB)
 
       block->header.key = (UWord) new_p;
       block->szB = szB;
-      block->actual_szB = VG_(malloc_usable_size)(new_p);
+      block->actual_szB = VG_(cli_malloc_usable_size)(new_p);
       block->n_ips = VG_(get_StackTrace)(tid, block->ips, STACK_DEPTH, NULL, NULL, 0);
 
       VG_(HT_add_node)(block_table, block);
@@ -794,8 +794,8 @@ static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
       {
          UWord addr = args[1];
          UWord len = args[2];
-         const Char* type = (const Char*) args[3];
-         const Char* label = (const Char*) args[4];
+         const HChar* type = (const HChar*) args[3];
+         const HChar* label = (const HChar*) args[4];
          SizeT type_len = VG_(strlen)(type);
          SizeT label_len = VG_(strlen)(label);
 
@@ -824,7 +824,7 @@ static Bool dg_handle_client_request(ThreadId tid, UWord *args, UWord *ret)
    case VG_USERREQ__START_EVENT:
    case VG_USERREQ__END_EVENT:
       {
-          const Char *label = (const Char *) args[1];
+          const HChar *label = (const HChar *) args[1];
           SizeT label_len = VG_(strlen)(label);
           if (label_len > 64) label_len = 64;
           out_byte(args[0] == VG_USERREQ__START_EVENT ? DG_R_START_EVENT : DG_R_END_EVENT);
@@ -860,7 +860,7 @@ static void dg_fini(Int exitcode)
 
    /* TODO: need to free the node entries */
    if (debuginfo_table != NULL)
-      VG_(HT_destruct)(debuginfo_table);
+      VG_(HT_destruct)(debuginfo_table, VG_(free));
 }
 
 static void dg_pre_clo_init(void)
