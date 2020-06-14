@@ -524,6 +524,8 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
          case Ist_Put:
          case Ist_PutI:
          case Ist_MBE:
+         case Ist_LoadG:  /* TODO: implement */
+         case Ist_StoreG: /* TODO: implement */
             addStmtToIRSB(sbOut, st);
             break;
          case Ist_Exit:
@@ -605,6 +607,7 @@ static IRSB* dg_instrument(VgCallbackClosure* closure,
             addStmtToIRSB(sbOut, st);
             break;
          default:
+            ppIRStmt(st);
             tl_assert(0);
       }
    }
