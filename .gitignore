@@ -541,6 +541,24 @@
 /exp-sgcheck/vgpreload_exp-sgcheck-*-linux.so
 /exp-sgcheck/vgpreload_exp-sgcheck-*-solaris.so
 
+# /exp-datagrind/
+/exp-datagrind/*.dSYM
+/exp-datagrind/.deps
+/exp-datagrind/Makefile
+/exp-datagrind/Makefile.in
+/exp-datagrind/exp-datagrind-*-darwin
+/exp-datagrind/exp-datagrind-*-linux
+/exp-datagrind/exp-datagrind-*-soliar
+/exp-datagrind/vgpreload_exp-datagrind-*-darwin.so
+/exp-datagrind/vgpreload_exp-datagrind-*-darwin.so.dSYM
+/exp-datagrind/vgpreload_exp-datagrind-*-linux.so
+
+# /ext-datagrind/tests/
+/exp-datagrind/tests/.deps
+/exp-datagrind/tests/Makefile
+/exp-datagrind/tests/Makefile.in
+/exp-datagrind/tests/sorts
+
 # /exp-sgcheck/docs/
 /exp-sgcheck/docs/Makefile
 /exp-sgcheck/docs/Makefile.in
