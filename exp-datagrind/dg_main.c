@@ -7,7 +7,7 @@
    This file is part of Datagrind, a tool for tracking data accesses.
    It borrows heavily from the Lackey tool.
 
-   Copyright (C) 2010 Bruce Merry
+   Copyright (C) 2010, 2020 Bruce Merry
       bmerry@users.sourceforge.net
 
    This program is free software; you can redistribute it and/or
