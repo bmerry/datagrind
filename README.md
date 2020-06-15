@@ -2,9 +2,6 @@ Datagrind is a valgrind tool that captures all read and write accesses made by
 a program and records them in a log file. A separate tool (`dg_view`), can then
 be used to visually represent the reads and writes.
 
-**It is currently suffering from bit-rot, and will not run on modern Linux
-systems. It needs to be ported to a newer version of Valgrind to work again.**
-
 To get started, run
 
     git clone https://github.com/bmerry/datagrind.git
